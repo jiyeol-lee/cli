@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+  <body>
+    <h1>Unrelated page heading</h1>
+    <h1 class="Page-headline">Selected AP headline</h1>
+    <div data-key="article"><p>This fallback must be ignored.</p></div>
+    <div class="RichTextBody">
+      <p>Opening paragraph.</p>
+      <div class="Infobox">
+        <div class="Infobox-items">
+          <p>First fact</p>
+          <p>Second fact with <strong>nested text</strong></p>
+        </div>
+      </div>
+      <ul>
+        <li>First list item</li>
+        <li>Second <em>list item</em></li>
+      </ul>
+      <h2>Level two</h2>
+      <h3>Level three</h3>
+      <h4>Level four</h4>
+      <h5>Level five</h5>
+      <h6>Level six</h6>
+      <section><p>Unknown containers are not recursively duplicated.</p></section>
+    </div>
+    <div class="RichTextBody"><p>A later body must be ignored.</p></div>
+  </body>
+</html>
