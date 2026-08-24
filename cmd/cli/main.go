@@ -12,6 +12,7 @@ import (
 
 	"github.com/jiyeol-lee/cli/internal/database"
 	"github.com/jiyeol-lee/cli/internal/gcal"
+	"github.com/jiyeol-lee/cli/internal/memory"
 	"github.com/jiyeol-lee/cli/internal/voca"
 	"github.com/jiyeol-lee/cli/internal/xdg"
 	"google.golang.org/api/calendar/v3"
@@ -29,21 +30,24 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	return runWithDependencies(ctx, args, dependencies{
-		newCalendar: newGoogleCalendar,
-		stdout:      os.Stdout,
+		newCalendar:       newGoogleCalendar,
+		directoryResolver: memory.Resolver{Runner: memory.GitWorktreeRunner{}},
+		stdout:            os.Stdout,
 	})
 }
 
 type dependencies struct {
-	newCalendar func(context.Context, xdg.Dirs) (gcal.Calendar, error)
-	stdout      io.Writer
+	newCalendar       func(context.Context, xdg.Dirs) (gcal.Calendar, error)
+	directoryResolver memory.DirectoryResolver
+	stdout            io.Writer
 }
 
 func runWithDependencies(ctx context.Context, args []string, deps dependencies) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: cli <voca|gcal> ...")
+		return fmt.Errorf("usage: cli <voca|gcal|memory> ...")
 	}
 	var calendarCommand gcal.Command
+	var memoryCommand memory.Command
 	switch args[0] {
 	case "voca":
 		if err := voca.ValidateCommand(args[1:]); err != nil {
@@ -59,6 +63,19 @@ func runWithDependencies(ctx context.Context, args []string, deps dependencies) 
 			return err
 		}
 		calendarCommand = command
+	case "memory":
+		command, err := memory.ParseCommand(args[1:])
+		if err != nil {
+			return err
+		}
+		if command.Help {
+			_, err := fmt.Fprintln(deps.stdout, memory.Usage)
+			return err
+		}
+		memoryCommand = command
+		if command.Kind == memory.CommandDirectory {
+			return (memory.App{Resolver: deps.directoryResolver, Stdout: deps.stdout}).Run(ctx, command)
+		}
 	default:
 		return fmt.Errorf("unknown app %q", args[0])
 	}
@@ -90,6 +107,21 @@ func runWithDependencies(ctx context.Context, args []string, deps dependencies) 
 			return err
 		}
 		return (gcal.App{Calendar: cal, Stdout: deps.stdout}).Run(ctx, calendarCommand)
+	case "memory":
+		db, err := database.OpenPermanent(dirs.PermanentDB())
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		if err := memory.Migrate(ctx, db); err != nil {
+			return err
+		}
+		app := memory.App{
+			Repo:     memory.NewRepository(db),
+			Resolver: deps.directoryResolver,
+			Stdout:   deps.stdout,
+		}
+		return app.Run(ctx, memoryCommand)
 	}
 	return nil
 }
