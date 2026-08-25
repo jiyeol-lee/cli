@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"google.golang.org/api/calendar/v3"
@@ -126,53 +127,53 @@ func normalizeEvent(item *calendar.Event, loc *time.Location) (Event, error) {
 }
 
 func Soon(events []Event, now time.Time) []Event {
-	var selected *Event
+	selected := []Event{}
+	var earliest time.Time
 	for i := range events {
-		e := &events[i]
+		e := events[i]
 		if e.AllDay || !e.startTime.After(now) {
 			continue
 		}
-		if selected == nil || e.startTime.Before(selected.startTime) {
-			selected = e
+		if len(selected) == 0 || e.startTime.Before(earliest) {
+			earliest = e.startTime
+			selected = []Event{e}
+			continue
+		}
+		if e.startTime.Equal(earliest) {
+			selected = append(selected, e)
 		}
 	}
-	if selected == nil {
-		return []Event{}
-	}
-	return []Event{*selected}
+	return selected
 }
 
 func InProgress(events []Event, now time.Time) []Event {
-	var selected *Event
+	selected := []Event{}
 	for i := range events {
-		e := &events[i]
+		e := events[i]
 		if e.AllDay || e.startTime.After(now) || !now.Before(e.endTime) {
 			continue
 		}
-		if selected == nil || e.startTime.Before(selected.startTime) {
-			selected = e
-		}
+		selected = append(selected, e)
 	}
-	if selected == nil {
-		return []Event{}
-	}
-	return []Event{*selected}
+	return selected
 }
 
-func WriteEvents(out io.Writer, events []Event, text bool) error {
+func WriteEvents(out io.Writer, events []Event, text bool, separator string) error {
 	if text {
+		if len(events) == 0 {
+			_, err := io.WriteString(out, "N/A\n")
+			return err
+		}
+		rendered := make([]string, 0, len(events))
 		for _, event := range events {
 			if event.AllDay {
-				if _, err := fmt.Fprintln(out, event.Summary); err != nil {
-					return err
-				}
+				rendered = append(rendered, event.Summary)
 				continue
 			}
-			if _, err := fmt.Fprintf(out, "%s (%s - %s)\n", event.Summary, event.startTime.Format("15:04"), event.endTime.Format("15:04")); err != nil {
-				return err
-			}
+			rendered = append(rendered, fmt.Sprintf("%s (%s - %s)", event.Summary, event.startTime.Format("15:04"), event.endTime.Format("15:04")))
 		}
-		return nil
+		_, err := io.WriteString(out, strings.Join(rendered, separator)+"\n")
+		return err
 	}
 	if events == nil {
 		events = []Event{}
