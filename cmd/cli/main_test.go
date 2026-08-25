@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jiyeol-lee/cli/internal/gcal"
+	"github.com/jiyeol-lee/cli/internal/memory"
 	"github.com/jiyeol-lee/cli/internal/xdg"
 )
 
@@ -89,6 +90,64 @@ func TestGcalHelpDoesNotRequireXDGDataHome(t *testing.T) {
 		t.Fatal("calendar dependency was constructed")
 	}
 	if got, want := out.String(), gcal.Usage+"\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestInvalidMemoryCommandsDoNotRequireXDGDataHome(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", "")
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "unknown", args: []string{"memory", "remove"}, want: `unknown memory command "remove"`},
+		{name: "bad read scope", args: []string{"memory", "read", "--scope", "local"}, want: "invalid memory scope"},
+		{name: "missing write options", args: []string{"memory", "write", "note"}, want: "usage: cli memory write"},
+		{name: "bad archive id", args: []string{"memory", "archive", "zero", "--scope", "global"}, want: "positive integer"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := runWithDependencies(context.Background(), tt.args, dependencies{})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestMemoryHelpDoesNotRequireXDGDataHome(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", "")
+	for _, args := range [][]string{{"memory"}, {"memory", "--help"}, {"memory", "-h"}} {
+		var out bytes.Buffer
+		if err := runWithDependencies(context.Background(), args, dependencies{stdout: &out}); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := out.String(), memory.Usage+"\n"; got != want {
+			t.Fatalf("stdout = %q, want %q", got, want)
+		}
+	}
+}
+
+type fixedDirectoryResolver struct {
+	directory string
+}
+
+func (r fixedDirectoryResolver) Resolve(context.Context) (string, error) {
+	return r.directory, nil
+}
+
+func TestMemoryDirectoryDoesNotRequireXDGDataHome(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", "")
+	var out bytes.Buffer
+	deps := dependencies{
+		directoryResolver: fixedDirectoryResolver{directory: "/main/worktree"},
+		stdout:            &out,
+	}
+	if err := runWithDependencies(context.Background(), []string{"memory", "directory"}, deps); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := out.String(), "/main/worktree\n"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
 }

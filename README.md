@@ -1,6 +1,6 @@
 # cli
 
-`cli` is one personal command-line program for vocabulary practice, AP News reading, and a read-only view of today's Google Calendar.
+`cli` is one personal command-line program for vocabulary practice, AP News reading, a read-only view of today's Google Calendar, and scoped conversation memories.
 
 ## Install
 
@@ -29,13 +29,20 @@ cli voca news
 cli gcal list [--text]
 cli gcal soon [--text]
 cli gcal in-progress [--text]
+
+cli memory directory
+cli memory read [--scope all|project|global]
+cli memory write <memory words...> --category preference|convention|note --scope project|global
+cli memory archive <positive-id> --scope project|global
 ```
 
 Calendar commands emit JSON arrays by default. `--text` prints `Summary (08:30 - 09:00)` for timed events and only the summary for all-day events.
 
+Memory commands store preferences, conventions, and notes at project or global scope. Project scope uses the main Git worktree path, so nested directories and linked worktrees share one group. Outside a Git repository, it uses the absolute current directory. `read` shows the current project's active memories first, followed by global memories. Writes and archives print nothing on success.
+
 ## Data locations
 
-Permanent data lives in `$XDG_DATA_HOME/cli`. `$XDG_DATA_HOME` must be an absolute path. The SQLite database is `cli.sqlite3`. The Google token has a fixed location:
+Permanent data lives in `$XDG_DATA_HOME/cli`. `$XDG_DATA_HOME` must be an absolute path. Vocabulary and memory data share the SQLite database at `cli.sqlite3`. The Google token has a fixed location:
 
 ```text
 $XDG_DATA_HOME/cli/google/oauth-token.json
