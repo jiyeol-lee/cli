@@ -13,12 +13,14 @@ type App struct {
 }
 
 type Command struct {
-	Name string
-	Text bool
-	Help bool
+	Name    string
+	Text    bool
+	Join    string
+	JoinSet bool
+	Help    bool
 }
 
-const Usage = "usage: cli gcal <list|soon|in-progress> [--text]"
+const Usage = "usage: cli gcal <list|soon|in-progress> [--text] [--join separator]"
 
 func ParseCommand(args []string) (Command, error) {
 	if len(args) == 0 {
@@ -33,10 +35,33 @@ func ParseCommand(args []string) (Command, error) {
 	if len(args) == 2 && (args[1] == "-h" || args[1] == "--help") {
 		return Command{Help: true}, nil
 	}
-	if len(args) > 2 || (len(args) == 2 && args[1] != "--text") {
-		return Command{}, fmt.Errorf("usage: cli gcal %s [--text]", args[0])
+	usage := fmt.Sprintf("usage: cli gcal %s [--text] [--join separator]", args[0])
+	command := Command{Name: args[0]}
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--text":
+			if command.Text {
+				return Command{}, fmt.Errorf("duplicate --text\n%s", usage)
+			}
+			command.Text = true
+		case "--join":
+			if command.JoinSet {
+				return Command{}, fmt.Errorf("duplicate --join\n%s", usage)
+			}
+			if i+1 == len(args) {
+				return Command{}, fmt.Errorf("missing separator for --join\n%s", usage)
+			}
+			i++
+			command.Join = args[i]
+			command.JoinSet = true
+		default:
+			return Command{}, fmt.Errorf("%s", usage)
+		}
 	}
-	return Command{Name: args[0], Text: len(args) == 2}, nil
+	if command.JoinSet && !command.Text {
+		return Command{}, fmt.Errorf("--join requires --text\n%s", usage)
+	}
+	return command, nil
 }
 
 func (a App) Run(ctx context.Context, command Command) error {
@@ -57,5 +82,9 @@ func (a App) Run(ctx context.Context, command Command) error {
 	case "in-progress":
 		events = InProgress(events, now)
 	}
-	return WriteEvents(a.Stdout, events, command.Text)
+	separator := "\n"
+	if command.JoinSet {
+		separator = command.Join
+	}
+	return WriteEvents(a.Stdout, events, command.Text, separator)
 }

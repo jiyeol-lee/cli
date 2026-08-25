@@ -26,9 +26,9 @@ cli voca study [phrase]
 cli voca story
 cli voca news
 
-cli gcal list [--text]
-cli gcal soon [--text]
-cli gcal in-progress [--text]
+cli gcal list [--text] [--join separator]
+cli gcal soon [--text] [--join separator]
+cli gcal in-progress [--text] [--join separator]
 
 cli memory directory
 cli memory read [--scope all|project|global]
@@ -36,7 +36,9 @@ cli memory write <memory words...> --category preference|convention|note --scope
 cli memory archive <positive-id> --scope project|global
 ```
 
-Calendar commands emit JSON arrays by default. `--text` prints `Summary (08:30 - 09:00)` for timed events and only the summary for all-day events.
+Calendar commands emit JSON arrays by default. Empty JSON output is `[]`. `--text` prints one event per line as `Summary (08:30 - 09:00)` for timed events and only the summary for all-day events. Text output always ends with a newline, and an empty result is `N/A`. `--join separator` replaces the newline between text events with the given separator and requires `--text`. The separator may be empty.
+
+`gcal in-progress` returns every timed event where the start is at or before the current time and the end is after it. `gcal soon` returns every timed event tied for the earliest start after the current time. Both commands preserve calendar order and exclude all-day events.
 
 Memory commands store preferences, conventions, and notes at project or global scope. Project scope uses the main Git worktree path, so nested directories and linked worktrees share one group. Outside a Git repository, it uses the absolute current directory. `read` shows the current project's active memories first, followed by global memories. Writes and archives print nothing on success.
 
