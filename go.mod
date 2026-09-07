@@ -1,6 +1,6 @@
 module github.com/jiyeol-lee/cli
 
-go 1.27.0
+go 1.26
 
 require (
 	github.com/mattn/go-sqlite3 v1.14.50
