@@ -3,6 +3,7 @@ package voca
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -32,11 +34,27 @@ type APScraper struct {
 	BaseURL string
 }
 
+var defaultAPHTTPClient = NewAPHTTPClient()
+
+func NewAPHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Protocols = new(http.Protocols)
+	transport.Protocols.SetHTTP1(true)
+	// Clear inherited HTTP/2 negotiation as well as restricting request protocols.
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
+	transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	return &http.Client{Transport: transport, Timeout: 15 * time.Second}
+}
+
 func (s APScraper) client() *http.Client {
 	if s.HTTP != nil {
 		return s.HTTP
 	}
-	return &http.Client{Timeout: 15 * time.Second}
+	return defaultAPHTTPClient
 }
 
 func (s APScraper) base() string {
@@ -265,17 +283,22 @@ func parseArticle(doc *html.Node) ArticlePage {
 			case "ul":
 				walk(child)
 			case "li":
-				body.WriteString("- " + text + "\n\n")
+				body.WriteString("- ")
+				body.WriteString(text)
+				body.WriteString("\n\n")
 			case "p":
 				if nodeUnderClass(child, "Infobox") {
-					body.WriteString("### " + text + "\n\n")
-				} else {
-					body.WriteString(text + "\n\n")
+					body.WriteString("### ")
 				}
+				body.WriteString(text)
+				body.WriteString("\n\n")
 			case "h2", "h3", "h4", "h5", "h6":
 				level := strings.TrimPrefix(child.Data, "h")
 				count, _ := strconv.Atoi(level)
-				body.WriteString(strings.Repeat("#", count) + " " + text + "\n\n")
+				body.WriteString(strings.Repeat("#", count))
+				body.WriteByte(' ')
+				body.WriteString(text)
+				body.WriteString("\n\n")
 			}
 		}
 	}
@@ -321,12 +344,7 @@ func attr(n *html.Node, key string) string {
 	return ""
 }
 func hasClass(n *html.Node, class string) bool {
-	for _, value := range strings.Fields(attr(n, "class")) {
-		if value == class {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(strings.Fields(attr(n, "class")), class)
 }
 
 type Pager interface {

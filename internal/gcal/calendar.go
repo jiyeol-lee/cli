@@ -172,7 +172,7 @@ func WriteEvents(out io.Writer, events []Event, text bool, separator string) err
 			}
 			rendered = append(rendered, fmt.Sprintf("%s (%s - %s)", event.Summary, event.startTime.Format("15:04"), event.endTime.Format("15:04")))
 		}
-		_, err := io.WriteString(out, strings.Join(rendered, separator)+"\n")
+		_, err := fmt.Fprintln(out, strings.Join(rendered, separator))
 		return err
 	}
 	if events == nil {

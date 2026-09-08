@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/jiyeol-lee/cli/internal/database"
 	"github.com/jiyeol-lee/cli/internal/gcal"
@@ -97,7 +96,7 @@ func runWithDependencies(ctx context.Context, args []string, deps dependencies) 
 		app := voca.App{
 			Repo:  repo,
 			AI:    voca.AIClient{HTTP: &http.Client{}, APIKey: os.Getenv("OPENCODE_GO_API_KEY")},
-			News:  voca.News{Scraper: voca.APScraper{HTTP: &http.Client{Timeout: 15 * time.Second}}, Pager: voca.TerminalPager{}},
+			News:  voca.News{Scraper: voca.APScraper{HTTP: voca.NewAPHTTPClient()}, Pager: voca.TerminalPager{}},
 			Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr,
 		}
 		return app.Run(ctx, args[1:])

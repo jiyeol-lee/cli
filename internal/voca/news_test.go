@@ -12,9 +12,95 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/html"
 )
+
+func TestAPHTTPClientUsesHTTP1(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Request-Protocol", r.Proto)
+		w.WriteHeader(http.StatusOK)
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	for _, tc := range []struct {
+		name   string
+		client *http.Client
+		want   string
+	}{
+		{"constructed", NewAPHTTPClient(), "HTTP/1.1"},
+		{"nil scraper client", (APScraper{}).client(), "HTTP/1.1"},
+		{"unchanged default transport", &http.Client{Transport: http.DefaultTransport, Timeout: 15 * time.Second}, "HTTP/2.0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.client.Timeout != 15*time.Second {
+				t.Fatalf("timeout = %v, want 15s", tc.client.Timeout)
+			}
+			original := tc.client.Transport.(*http.Transport)
+			if original.Proxy == nil || original.DialContext == nil || original.TLSHandshakeTimeout != 10*time.Second {
+				t.Fatal("standard proxy, dial, or TLS timeout defaults were lost")
+			}
+			transport := original.Clone()
+			transport.TLSClientConfig.RootCAs = server.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+			if transport.TLSClientConfig.InsecureSkipVerify {
+				t.Fatal("TLS certificate verification is disabled")
+			}
+			t.Cleanup(transport.CloseIdleConnections)
+			client := *tc.client
+			client.Transport = transport
+			resp, err := client.Get(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.Proto != tc.want || resp.Header.Get("Request-Protocol") != tc.want {
+				t.Fatalf("response protocol = %s, request protocol = %s, want %s", resp.Proto, resp.Header.Get("Request-Protocol"), tc.want)
+			}
+		})
+	}
+	custom := &http.Client{Timeout: time.Second}
+	if (APScraper{HTTP: custom}).client() != custom {
+		t.Fatal("injected client was replaced")
+	}
+}
+
+func TestAPScraperRejectsForbidden(t *testing.T) {
+	for _, command := range []string{"headlines", "article"} {
+		t.Run(command, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if got := r.Header.Get("User-Agent"); got != "cli/1.0 (+personal terminal reader)" {
+					t.Errorf("User-Agent = %q", got)
+				}
+				w.Header().Set("Cf-Mitigated", "challenge")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(w, `<h1 class="Page-headline">Challenge</h1><div class="RichTextBody"><p>Not article content.</p></div>`)
+			}))
+			t.Cleanup(server.Close)
+			client := NewAPHTTPClient()
+			t.Cleanup(client.CloseIdleConnections)
+			scraper := APScraper{HTTP: client, BaseURL: server.URL}
+			var err error
+			want := "AP News returned 403 Forbidden"
+			if command == "headlines" {
+				_, err = scraper.Headlines(context.Background())
+				want = "fetch AP News: " + want
+			} else {
+				_, err = scraper.Article(context.Background(), server.URL)
+			}
+			if err == nil || err.Error() != want {
+				t.Fatalf("error = %v, want %q", err, want)
+			}
+			if requests != 1 {
+				t.Fatalf("requests = %d, want 1", requests)
+			}
+		})
+	}
+}
 
 func TestParseHeadlinesPreservesAPHierarchyAndDocumentOrder(t *testing.T) {
 	file, err := os.Open("testdata/ap_headlines.html")
