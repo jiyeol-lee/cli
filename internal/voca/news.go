@@ -3,6 +3,7 @@ package voca
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -32,11 +33,27 @@ type APScraper struct {
 	BaseURL string
 }
 
+var defaultAPHTTPClient = NewAPHTTPClient()
+
+func NewAPHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Protocols = new(http.Protocols)
+	transport.Protocols.SetHTTP1(true)
+	// Clear inherited HTTP/2 negotiation as well as restricting request protocols.
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
+	transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	return &http.Client{Transport: transport, Timeout: 15 * time.Second}
+}
+
 func (s APScraper) client() *http.Client {
 	if s.HTTP != nil {
 		return s.HTTP
 	}
-	return &http.Client{Timeout: 15 * time.Second}
+	return defaultAPHTTPClient
 }
 
 func (s APScraper) base() string {
