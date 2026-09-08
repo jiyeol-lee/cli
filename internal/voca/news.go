@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -282,17 +283,22 @@ func parseArticle(doc *html.Node) ArticlePage {
 			case "ul":
 				walk(child)
 			case "li":
-				body.WriteString("- " + text + "\n\n")
+				body.WriteString("- ")
+				body.WriteString(text)
+				body.WriteString("\n\n")
 			case "p":
 				if nodeUnderClass(child, "Infobox") {
-					body.WriteString("### " + text + "\n\n")
-				} else {
-					body.WriteString(text + "\n\n")
+					body.WriteString("### ")
 				}
+				body.WriteString(text)
+				body.WriteString("\n\n")
 			case "h2", "h3", "h4", "h5", "h6":
 				level := strings.TrimPrefix(child.Data, "h")
 				count, _ := strconv.Atoi(level)
-				body.WriteString(strings.Repeat("#", count) + " " + text + "\n\n")
+				body.WriteString(strings.Repeat("#", count))
+				body.WriteByte(' ')
+				body.WriteString(text)
+				body.WriteString("\n\n")
 			}
 		}
 	}
@@ -338,12 +344,7 @@ func attr(n *html.Node, key string) string {
 	return ""
 }
 func hasClass(n *html.Node, class string) bool {
-	for _, value := range strings.Fields(attr(n, "class")) {
-		if value == class {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(strings.Fields(attr(n, "class")), class)
 }
 
 type Pager interface {
