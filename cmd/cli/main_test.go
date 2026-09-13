@@ -176,8 +176,11 @@ func TestWorkmuxParsingDoesNotConstructDependencies(t *testing.T) {
 		{args: []string{"workmux", "help", "remove"}},
 		{args: []string{"workmux", "add"}, wantErr: true},
 		{args: []string{"workmux", "list"}, wantErr: true},
-		{args: []string{"workmux", "merge", "--force"}, wantErr: true},
-		{args: []string{"workmux", "remove", "one", "two"}, wantErr: true},
+		{args: []string{"workmux", "merge", "topic", "--unknown"}, wantErr: true},
+		{args: []string{"workmux", "merge", "--into"}, wantErr: true},
+		{args: []string{"workmux", "sandbox", "build", "--no-cache", "--help"}},
+		{args: []string{"workmux", "sandbox", "run", "--help"}},
+		{args: []string{"workmux", "merge", "one", "two"}, wantErr: true},
 		{args: []string{"workmux", "_cleanup"}, wantErr: true},
 		{args: []string{"workmux", "_cleanup", "--help"}, wantErr: true},
 	} {
@@ -225,9 +228,18 @@ func TestWorkmuxDispatchDoesNotOpenDatabase(t *testing.T) {
 			Getwd: func() (string, error) { return repo, nil },
 		}, nil
 	}}
-	err := runWithDependencies(context.Background(), []string{"workmux", "close", "topic"}, deps)
-	if err == nil || !strings.Contains(err.Error(), "test Git unavailable") || !runner.called {
-		t.Fatalf("error = %v, Git called = %v; want workmux dispatch without database resolution", err, runner.called)
+	for _, args := range [][]string{
+		{"workmux", "close", "topic"},
+		{"workmux", "sandbox", "run"},
+		{"workmux", "sandbox", "build", "--no-cache"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			runner.called = false
+			err := runWithDependencies(context.Background(), args, deps)
+			if err == nil || !strings.Contains(err.Error(), "test Git unavailable") || !runner.called {
+				t.Fatalf("error = %v, Git called = %v; want workmux dispatch without database resolution", err, runner.called)
+			}
+		})
 	}
 }
 
@@ -364,10 +376,10 @@ func TestPrivateWorkmuxDispatchUsesCapturedPaths(t *testing.T) {
 		command = launch.Command
 		return nil
 	})
-	if err := app.Run(context.Background(), workmux.Command{Kind: "add", Name: "topic", Background: true}); err != nil {
+	if err := app.Run(context.Background(), workmux.Command{Kind: "add", Name: "topic"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.Run(context.Background(), workmux.Command{Kind: "remove", Name: "topic", KeepBranch: true}); err != nil {
+	if err := app.Run(context.Background(), workmux.Command{Kind: "remove", Name: "topic"}); err != nil {
 		t.Fatal(err)
 	}
 	statePath := filepath.Join(paths.StateDir, command.RepoID, command.ID+".json")

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -56,6 +57,11 @@ func TestMain(m *testing.M) {
 		paths := CleanupPaths{HomeDir: os.Getenv("WORKMUX_TEST_HOME"), StateDir: os.Getenv("WORKMUX_TEST_STATE"), ConfigDir: os.Getenv("WORKMUX_TEST_CONFIG")}
 		command, err := ParseCommand(os.Args[2:])
 		if err == nil {
+			if path := os.Getenv("WORKMUX_TEST_PARENT_PID"); path != "" {
+				if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+					os.Exit(2)
+				}
+			}
 			if gate := os.Getenv("WORKMUX_TEST_GATE"); gate != "" {
 				deadline := time.Now().Add(15 * time.Second)
 				for time.Now().Before(deadline) {
@@ -182,7 +188,7 @@ func (run cleanupRunFunc) Run(ctx context.Context, p Process) ([]byte, error) {
 
 func queuedCleanup(t *testing.T, f *hostFixture) (*stateStore, workspaceState, CleanupCommand) {
 	t.Helper()
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	store := hostStateStore(t, f)
@@ -202,7 +208,7 @@ func queuedCleanup(t *testing.T, f *hostFixture) (*stateStore, workspaceState, C
 	}
 	window.Caller = true
 	state.Stage = "removing"
-	state.Removal = &removalState{Head: source.Head, KeepBranch: true, HookDone: true, Identity: saved,
+	state.Removal = &removalState{Head: source.Head, HookDone: true, Identity: saved,
 		Job: &cleanupJob{Token: token, Status: "queued", Deadline: time.Now().Add(cleanupLease).UnixNano(), Window: window}}
 	if err := store.save(state); err != nil {
 		t.Fatal(err)
@@ -223,7 +229,7 @@ func armCleanup(t *testing.T, store *stateStore, state *workspaceState) {
 
 func TestCleanupExternalClosesAndPollsBeforeDeletion(t *testing.T) {
 	f := newHostFixture(t, "pre_remove: [check]\n")
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	checks := 0
@@ -246,7 +252,7 @@ func TestCleanupExternalClosesAndPollsBeforeDeletion(t *testing.T) {
 		}
 		return nil
 	}
-	if err := f.run(t, "remove", "topic", "--keep-branch"); err != nil {
+	if err := f.run(t, "remove", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	hostEventBefore(t, f.events, "hook:check", "mux:close")
@@ -257,7 +263,7 @@ func TestCleanupWindowTimeoutAndCloseFailureAreRetriable(t *testing.T) {
 	for _, failure := range []string{"timeout", "close"} {
 		t.Run(failure, func(t *testing.T) {
 			f := newHostFixture(t, "")
-			if err := f.run(t, "add", "topic", "-b"); err != nil {
+			if err := f.run(t, "add", "topic"); err != nil {
 				t.Fatal(err)
 			}
 			f.app.cleanupTimeout = 50 * time.Millisecond
@@ -267,7 +273,7 @@ func TestCleanupWindowTimeoutAndCloseFailureAreRetriable(t *testing.T) {
 				}
 				return nil
 			}
-			if err := f.run(t, "remove", "topic", "--force"); err == nil {
+			if err := f.run(t, "remove", "topic"); err == nil {
 				t.Fatal("expected shutdown failure")
 			}
 			state := f.load(t, "topic")
@@ -292,7 +298,7 @@ func TestCleanupWindowTimeoutAndCloseFailureAreRetriable(t *testing.T) {
 
 func TestCleanupSpawnFailureDoesNotCloseCaller(t *testing.T) {
 	f := newHostFixture(t, "pre_remove: [check]\n")
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	f.mux.caller = true
@@ -346,7 +352,7 @@ func TestCleanupDiagnosticErrors(t *testing.T) {
 
 func TestCleanupDiagnosticFailureDoesNotCancelScheduledJob(t *testing.T) {
 	f := newHostFixture(t, "")
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	f.mux.caller = true
@@ -356,7 +362,7 @@ func TestCleanupDiagnosticFailureDoesNotCancelScheduledJob(t *testing.T) {
 		}
 		return nil
 	})
-	if err := f.run(t, "remove", "topic", "--keep-branch"); !errors.Is(err, os.ErrClosed) || !strings.Contains(err.Error(), "write cleanup diagnostic") {
+	if err := f.run(t, "remove", "topic"); !errors.Is(err, os.ErrClosed) || !strings.Contains(err.Error(), "write cleanup diagnostic") {
 		t.Fatalf("lost diagnostic failure: %v", err)
 	}
 	state := f.load(t, "topic")
@@ -370,7 +376,7 @@ func TestCleanupSpawnFailurePreservesSecondaryErrors(t *testing.T) {
 	for _, failure := range []string{"diagnostic", "checkpoint"} {
 		t.Run(failure, func(t *testing.T) {
 			f := newHostFixture(t, "")
-			if err := f.run(t, "add", "topic", "-b"); err != nil {
+			if err := f.run(t, "add", "topic"); err != nil {
 				t.Fatal(err)
 			}
 			want := fmt.Errorf("spawn failed")
@@ -388,7 +394,7 @@ func TestCleanupSpawnFailurePreservesSecondaryErrors(t *testing.T) {
 				}
 				return want
 			})
-			err := f.run(t, "remove", "topic", "--keep-branch")
+			err := f.run(t, "remove", "topic")
 			if !errors.Is(err, want) || !strings.Contains(err.Error(), "cleanup "+failure) {
 				t.Fatalf("lost primary or secondary failure: %v", err)
 			}
@@ -406,7 +412,7 @@ func TestCleanupConcreteSpawnerRejectsBadOrMissingHandshake(t *testing.T) {
 	for _, mode := range []string{"bad-ready", "no-ready"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newHostFixture(t, "")
-			if err := f.run(t, "add", "topic", "-b"); err != nil {
+			if err := f.run(t, "add", "topic"); err != nil {
 				t.Fatal(err)
 			}
 			pidPath := filepath.Join(f.home, "worker-pid")
@@ -416,7 +422,7 @@ func TestCleanupConcreteSpawnerRejectsBadOrMissingHandshake(t *testing.T) {
 			f.app.Spawner = ExecCleanupSpawner{}
 			ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
 			defer cancel()
-			err := f.app.Run(ctx, Command{Kind: "remove", Name: "topic", KeepBranch: true})
+			err := f.app.Run(ctx, Command{Kind: "remove", Name: "topic"})
 			if err == nil || !strings.Contains(err.Error(), "handshake failed") {
 				t.Fatalf("invalid worker handshake succeeded: %v", err)
 			}
@@ -529,7 +535,7 @@ func TestCleanupExecutionOutlivesHandoffLease(t *testing.T) {
 
 func TestCleanupSchedulingOutputPrecedesArming(t *testing.T) {
 	f := newHostFixture(t, "")
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	f.mux.caller = true
@@ -540,7 +546,7 @@ func TestCleanupSchedulingOutputPrecedesArming(t *testing.T) {
 		}
 		return 0, syscall.EPIPE
 	})
-	if err := f.run(t, "remove", "topic", "--keep-branch"); err == nil {
+	if err := f.run(t, "remove", "topic"); err == nil {
 		t.Fatal("ignored scheduling output failure")
 	}
 	if state := f.load(t, "topic"); state.Removal.Job.Status != "failed" || state.Removal.WorktreeRemoved || f.mux.window == "" {
@@ -603,7 +609,7 @@ func TestCleanupSocketLoss(t *testing.T) {
 			if exited, err := tmuxServerExited(captured.ServerPID); err != nil || exited {
 				t.Fatalf("test lost original live tmux server: %v, %v", exited, err)
 			}
-			f.app.Mux = mux
+			f.app.Mux = tmuxNoClient{Tmux: mux}
 			f.app.cleanupTimeout = 50 * time.Millisecond
 			if err := f.app.RunCleanup(ctx, command, cleanupReadyFunc(func(data []byte) (int, error) {
 				armCleanup(t, store, &state)
@@ -618,11 +624,11 @@ func TestCleanupSocketLoss(t *testing.T) {
 				t.Fatal("worktree disappeared", err)
 			}
 			for range 3 {
-				if err := f.run(t, "remove", "topic", "--keep-branch"); err == nil {
+				if err := f.run(t, "remove", "topic"); err == nil {
 					t.Fatal("public retry discarded the unreachable captured server")
 				}
 				current := f.load(t, "topic")
-				if current.Removal.WorktreeRemoved || current.Stage == "removed" || current.Removal.Job.Token != captured.Token || current.Removal.Job.Window != captured {
+				if current.Removal.WorktreeRemoved || current.Stage == "removed" || current.Removal.Job.Token != captured.Token || !reflect.DeepEqual(current.Removal.Job.Window, captured) {
 					t.Fatalf("public retry erased the original capture: %+v", current)
 				}
 				if current.ServerPID != captured.ServerPID || current.SocketDevice != captured.SocketDevice || current.SocketInode != captured.SocketInode {
@@ -635,11 +641,11 @@ func TestCleanupSocketLoss(t *testing.T) {
 			if err := f.run(t, "close", "topic"); err == nil {
 				t.Fatal("close claimed the live, unreachable server was gone")
 			}
-			if err := f.run(t, "remove", "topic", "--keep-branch"); err == nil {
+			if err := f.run(t, "remove", "topic"); err == nil {
 				t.Fatal("close followed by remove erased the server baseline")
 			}
 			hostGit(t, state.Path, "commit", "--allow-empty", "-m", "retain newer work")
-			if err := f.run(t, "remove", "topic", "--keep-branch"); err == nil {
+			if err := f.run(t, "remove", "topic"); err == nil {
 				t.Fatal("adopting a new HEAD erased the captured server baseline")
 			}
 			if current := f.load(t, "topic"); current.ServerPID != captured.ServerPID || current.SocketInode != captured.SocketInode || current.Removal.WorktreeRemoved {
@@ -664,8 +670,8 @@ func TestCleanupSocketLossBeforeCapture(t *testing.T) {
 		t.Run(fmt.Sprintf("legacy=%v", legacy), func(t *testing.T) {
 			ctx, runner, mux, _ := isolatedTmux(t)
 			f := newHostFixture(t, "")
-			f.app.Mux = mux
-			if err := f.run(t, "add", "topic", "-b"); err != nil {
+			f.app.Mux = tmuxNoClient{Tmux: mux}
+			if err := f.run(t, "add", "topic"); err != nil {
 				t.Fatal(err)
 			}
 			state := f.load(t, "topic")
@@ -694,7 +700,7 @@ func TestCleanupSocketLossBeforeCapture(t *testing.T) {
 				_, _ = oldRunner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
 			})
 			for range 3 {
-				if err := f.run(t, "remove", "topic", "--keep-branch"); err == nil || !strings.Contains(err.Error(), "restore") {
+				if err := f.run(t, "remove", "topic"); err == nil || !strings.Contains(err.Error(), "restore") {
 					t.Fatalf("missing initial socket was treated as absence: %v", err)
 				}
 				if err := f.run(t, "close", "topic"); err == nil {
@@ -718,7 +724,7 @@ func TestCleanupSocketLossBeforeCapture(t *testing.T) {
 			if err := os.Rename(alias, runner.socket); err != nil {
 				t.Fatal(err)
 			}
-			if err := f.run(t, "remove", "topic", "--keep-branch"); err != nil {
+			if err := f.run(t, "remove", "topic"); err != nil {
 				t.Fatal("restoring the original socket did not permit normal automatic cleanup", err)
 			}
 		})
@@ -752,9 +758,9 @@ func TestCleanupLegacyFailedSocketLoss(t *testing.T) {
 		defer cancel()
 		_, _ = oldRunner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
 	})
-	f.app.Mux = mux
+	f.app.Mux = tmuxNoClient{Tmux: mux}
 	for range 3 {
-		if err := f.run(t, "remove", "topic", "--keep-branch"); err == nil || !strings.Contains(err.Error(), "restore") {
+		if err := f.run(t, "remove", "topic"); err == nil || !strings.Contains(err.Error(), "restore") {
 			t.Fatalf("legacy failed job became an empty capture: %v", err)
 		}
 		if current := f.load(t, "topic"); current.Removal.Job.Token != state.Removal.Job.Token || current.Removal.Job.Window.ID != window || current.Removal.WorktreeRemoved {
@@ -773,8 +779,8 @@ func TestCleanupLegacyFailedSocketLoss(t *testing.T) {
 func TestCleanupRetryRotatesTokenOnVerifiedServer(t *testing.T) {
 	ctx, runner, mux, _ := isolatedTmux(t)
 	f := newHostFixture(t, "")
-	f.app.Mux = mux
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	f.app.Mux = tmuxNoClient{Tmux: mux}
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	blocked := mux
@@ -787,15 +793,15 @@ func TestCleanupRetryRotatesTokenOnVerifiedServer(t *testing.T) {
 		return runner.Run(ctx, p)
 	})
 	f.app.Mux = blocked
-	if err := f.run(t, "remove", "topic", "--keep-branch"); err == nil {
+	if err := f.run(t, "remove", "topic"); err == nil {
 		t.Fatal("expected first close to fail")
 	}
 	old := f.load(t, "topic")
 	if _, err := runner.Run(ctx, Process{Name: "tmux", Args: []string{"set-option", "-w", "-t", old.Window, "@cli_workmux_cleanup", strings.Repeat("e", 32)}}); err != nil {
 		t.Fatal(err)
 	}
-	f.app.Mux = mux
-	if err := f.run(t, "remove", "topic", "--keep-branch"); err != nil {
+	f.app.Mux = tmuxNoClient{Tmux: mux}
+	if err := f.run(t, "remove", "topic"); err != nil {
 		t.Fatal("verified same-server retry could not replace an obsolete token", err)
 	}
 	current := f.load(t, "topic")
@@ -812,7 +818,7 @@ func TestCleanupRetryRotatesTokenOnVerifiedServer(t *testing.T) {
 func TestCleanupBrokenStdoutDoesNotArmWorker(t *testing.T) {
 	ctx, runner, mux, session := isolatedTmux(t)
 	f := newHostFixture(t, "")
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	state := f.load(t, "topic")
@@ -850,7 +856,7 @@ func TestCleanupBrokenStdoutDoesNotArmWorker(t *testing.T) {
 		}
 	})
 	pidPath := filepath.Join(f.home, "broken-pipe-worker")
-	cmd := exec.CommandContext(ctx, executable, "workmux", "remove", "--keep-branch")
+	cmd := exec.CommandContext(ctx, executable, "workmux", "remove")
 	cmd.Dir = state.Path
 	cmd.Env = append(os.Environ(), "HOME="+f.home, "WORKMUX_TEST_HOME="+f.home,
 		"WORKMUX_TEST_STATE="+f.state, "WORKMUX_TEST_CONFIG="+f.config, "WORKMUX_TEST_OUTPUT=",
@@ -888,7 +894,7 @@ func TestCleanupBrokenStdoutDoesNotArmWorker(t *testing.T) {
 }
 
 func TestCleanupWorkerRejectsChangedIdentityRefAndToken(t *testing.T) {
-	for _, kind := range []string{"directory", "symlink", "admin", "ref", "dirty", "ignored", "token", "cancel", "expired"} {
+	for _, kind := range []string{"directory", "symlink", "admin", "ref", "dirty", "token", "cancel", "expired"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newHostFixture(t, "")
 			store, state, command := queuedCleanup(t, f)
@@ -933,8 +939,6 @@ func TestCleanupWorkerRejectsChangedIdentityRefAndToken(t *testing.T) {
 					hostGit(t, state.Path, "commit", "--allow-empty", "-m", "concurrent commit")
 				case "dirty":
 					hostWrite(t, filepath.Join(state.Path, "tracked"), "late work")
-				case "ignored":
-					hostWrite(t, filepath.Join(state.Path, ".env"), "SECRET=value")
 				}
 				if err := store.unlock(); err != nil {
 					t.Fatal(err)
@@ -963,7 +967,7 @@ func TestCleanupWorkerDuplicateCannotRemoveRecreatedWorkspace(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	var ready bytes.Buffer
@@ -977,7 +981,7 @@ func TestCleanupWorkerDuplicateCannotRemoveRecreatedWorkspace(t *testing.T) {
 
 func TestCleanupSchedulingIsNotCompletionAndCanBeCancelled(t *testing.T) {
 	f := newHostFixture(t, "")
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	f.mux.caller = true
@@ -1006,12 +1010,12 @@ func TestCleanupSchedulingIsNotCompletionAndCanBeCancelled(t *testing.T) {
 
 func TestCleanupExpiredMissingWorkerCanBeRetried(t *testing.T) {
 	f := newHostFixture(t, "")
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	f.mux.caller = true
 	f.app.Spawner = cleanupSpawnFunc(func(context.Context, CleanupLaunch) error { return nil })
-	if err := f.run(t, "remove", "topic", "--keep-branch"); err != nil {
+	if err := f.run(t, "remove", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	store := hostStateStore(t, f)
@@ -1038,18 +1042,19 @@ func TestCleanupExpiredMissingWorkerCanBeRetried(t *testing.T) {
 
 func TestCleanupRemoveDoesNotClaimNewMergeSuccess(t *testing.T) {
 	f := newHostFixture(t, "")
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.run(t, "merge", "topic", "--keep"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	w := f.load(t, "topic")
+	// A completed kept merge from the previous version is readable, but does
+	// not make a later explicit remove report a new merge.
+	w.MergeKept, w.MergedCommit, w.MergeTarget = true, w.InitialCommit, "main"
+	savePolicyState(t, f, w)
 	hostGit(t, w.Path, "commit", "--allow-empty", "-m", "unmerged retained work")
 	f.stdout.Reset()
 	f.mux.caller = true
 	f.app.Spawner = cleanupSpawnFunc(func(context.Context, CleanupLaunch) error { return nil })
-	if err := f.run(t, "remove", "topic", "--keep-branch"); err != nil {
+	if err := f.run(t, "remove", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(f.stdout.String(), "cleanup scheduled") || strings.Contains(f.stdout.String(), "merge succeeded") {
@@ -1063,7 +1068,7 @@ func TestCleanupRemoveDoesNotClaimNewMergeSuccess(t *testing.T) {
 func TestCleanupExternalUsesSavedSocketWithoutTMUX(t *testing.T) {
 	ctx, runner, mux, session := isolatedTmux(t)
 	f := newHostFixture(t, "")
-	if err := f.run(t, "add", "topic", "-b"); err != nil {
+	if err := f.run(t, "add", "topic"); err != nil {
 		t.Fatal(err)
 	}
 	w := f.load(t, "topic")
@@ -1083,7 +1088,7 @@ func TestCleanupExternalUsesSavedSocketWithoutTMUX(t *testing.T) {
 	t.Setenv("TMUX", "")
 	t.Setenv("TMUX_PANE", "")
 	f.app.Mux = Tmux{Runner: ExecRunner{}}
-	if err := f.run(t, "remove", "topic", "--keep-branch"); err != nil {
+	if err := f.run(t, "remove", "topic"); err != nil {
 		t.Fatal("external cleanup lost original named-server routing", err)
 	}
 	state := f.load(t, "topic")
@@ -1096,21 +1101,22 @@ func TestCleanupExternalUsesSavedSocketWithoutTMUX(t *testing.T) {
 }
 
 func TestCleanupActualSelfWindowProcess(t *testing.T) {
-	for _, command := range []string{"remove", "merge"} {
+	for _, command := range []string{"remove", "merge", "remove-unmerged"} {
 		t.Run(command, func(t *testing.T) {
 			ctx, runner, mux, session := isolatedTmux(t)
 			f := newHostFixture(t, "pre_remove:\n  - |\n    printf 'run\\n' >> \"$HOME/hook-count\"\n")
-			if err := f.run(t, "add", "topic", "-b"); err != nil {
+			if err := f.run(t, "add", "topic"); err != nil {
 				t.Fatal(err)
 			}
 			w := f.load(t, "topic")
-			if command == "merge" {
+			if command == "merge" || command == "remove-unmerged" {
 				hostWrite(t, filepath.Join(w.Path, "tracked"), "merged work\n")
 				hostGit(t, w.Path, "commit", "-am", "merge source")
 			}
 			gate := filepath.Join(f.home, "start")
 			proofPath := filepath.Join(f.home, "proof")
 			output := filepath.Join(f.home, "output")
+			parentPIDPath := filepath.Join(f.home, "parent-pid")
 			executable, err := os.Executable()
 			if err != nil {
 				t.Fatal(err)
@@ -1118,9 +1124,10 @@ func TestCleanupActualSelfWindowProcess(t *testing.T) {
 			paneCommand := []string{"env", "HOME=" + f.home, "WORKMUX_TEST_HOME=" + f.home,
 				"WORKMUX_TEST_STATE=" + f.state, "WORKMUX_TEST_CONFIG=" + f.config,
 				"WORKMUX_TEST_GATE=" + gate, "WORKMUX_TEST_PROOF=" + proofPath,
+				"WORKMUX_TEST_PARENT_PID=" + parentPIDPath,
 				"WORKMUX_TEST_OUTPUT=" + output, "WORKMUX_TEST_HOLD_PARENT=1", executable, "workmux", command}
-			if command == "remove" {
-				paneCommand = append(paneCommand, "--keep-branch")
+			if command == "remove-unmerged" {
+				paneCommand[len(paneCommand)-1] = "remove"
 			}
 			window, err := mux.Create(ctx, session, freshTmuxWorkspace(w.Workspace), []Pane{{}}, [][]string{paneCommand})
 			if err != nil {
@@ -1138,9 +1145,13 @@ func TestCleanupActualSelfWindowProcess(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			parentPID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
-			if err != nil || parentPID <= 1 {
+			panePID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+			if err != nil || panePID <= 1 {
 				t.Fatalf("invalid source pane PID %q", pidData)
+			}
+			parentPID := waitTestProcessPID(t, ctx, parentPIDPath)
+			if parentPID == panePID {
+				t.Fatal("configured helper must be distinct from pane supervisor")
 			}
 			if command == "merge" {
 				// Exercise the last-window case: the entire isolated server exits.
@@ -1192,15 +1203,44 @@ func TestCleanupActualSelfWindowProcess(t *testing.T) {
 				t.Fatalf("source window remains: %v, %v", present, err)
 			}
 			if command == "remove" {
-				if got := hostGit(t, f.root, "rev-parse", "topic"); got != w.InitialCommit {
-					t.Fatal("self-window removal deleted kept branch")
+				if got := hostGit(t, f.root, "for-each-ref", "--format=%(refname)", "refs/heads/topic"); got != "" {
+					t.Fatal("self-window removal kept branch")
+				}
+			} else if command == "remove-unmerged" {
+				if bytes.Contains(data, []byte("[y/N]")) || hostGit(t, f.root, "rev-parse", "main") != w.InitialCommit {
+					t.Fatal("clean unmerged cleanup prompted or changed target")
+				}
+				if refs := hostGit(t, f.root, "for-each-ref", "--format=%(refname)", "refs/heads/topic"); refs != "" {
+					t.Fatal("self-window cleanup retained approved unmerged branch")
 				}
 			} else if got := hostGit(t, f.root, "rev-parse", "main"); got != state.MergedCommit {
 				t.Fatal("self-window merge lost target commit")
 			}
 			waitCleanupProcessExit(t, ctx, parentPID)
+			waitCleanupProcessExit(t, ctx, panePID)
 			waitCleanupProcessExit(t, ctx, proof.PID)
 		})
+	}
+}
+
+func waitTestProcessPID(t *testing.T, ctx context.Context, path string) int {
+	t.Helper()
+	for {
+		data, err := os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if len(data) != 0 {
+			pid, err := strconv.Atoi(string(data))
+			if err != nil || pid <= 1 {
+				t.Fatalf("invalid process PID in %s: %q, %v", path, data, err)
+			}
+			return pid
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("timed out waiting for process PID in %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1224,5 +1264,115 @@ func waitCleanupProcessExit(t *testing.T, ctx context.Context, pid int) {
 			t.Fatalf("cleanup left process %d running", pid)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestCleanupLateDirtIsNotForcedAway(t *testing.T) {
+	for _, timing := range []string{"captured existence", "native removal"} {
+		for _, name := range []string{"tracked", "fresh-untracked"} {
+			t.Run(timing+"/"+name, func(t *testing.T) {
+				f := newHostFixture(t, "")
+				w := policyCommit(t, f)
+				written := false
+				if timing == "captured existence" {
+					f.mux.onExists = func(Workspace, CleanupWindow) (bool, error) {
+						if f.mux.window == "" && !written {
+							written = true
+							hostWrite(t, filepath.Join(w.Path, name), "late work")
+						}
+						return f.mux.window != "", nil
+					}
+				} else {
+					f.runner.git = func(p Process) error {
+						args := hostGitArgs(p)
+						if len(args) > 1 && args[0] == "worktree" && args[1] == "remove" {
+							if slices.Contains(args, "--force") {
+								t.Fatal("native dirt protection disabled")
+							}
+							written = true
+							hostWrite(t, filepath.Join(w.Path, name), "late work")
+						}
+						return nil
+					}
+				}
+				if err := f.run(t, "remove", "topic"); err == nil || !written {
+					t.Fatalf("late dirt not refused: %v, written=%t", err, written)
+				}
+				checkFile(t, filepath.Join(w.Path, name), "late work")
+				if f.load(t, "topic").Removal.WorktreeRemoved {
+					t.Fatal("late dirty worktree marked removed")
+				}
+			})
+		}
+	}
+}
+
+func TestCleanupCancelledSuccessfulSpawnerCannotArm(t *testing.T) {
+	f := newHostFixture(t, "")
+	w := policyCommit(t, f)
+	f.mux.caller = true
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var command CleanupCommand
+	f.app.Spawner = cleanupSpawnFunc(func(_ context.Context, launch CleanupLaunch) error { command = launch.Command; cancel(); return nil })
+	if err := f.app.Run(ctx, Command{Kind: "remove", Name: "topic"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled readiness succeeded: %v", err)
+	}
+	state := f.load(t, "topic")
+	if state.Removal.Job.Status != "cancelled" || f.mux.window == "" {
+		t.Fatalf("cancelled handoff armed or closed: %+v", state)
+	}
+	var ready bytes.Buffer
+	if err := f.app.RunCleanup(t.Context(), command, &ready); err == nil || ready.Len() != 0 {
+		t.Fatal("cancelled worker became ready")
+	}
+	if _, err := os.Stat(w.Path); err != nil {
+		t.Fatal("cancelled handoff deleted source")
+	}
+}
+
+func TestCleanupOnlyRemovesEmptyModules(t *testing.T) {
+	for _, kind := range []string{"empty", "nonempty", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newHostFixture(t, "")
+			w := policyCommit(t, f)
+			pointer, err := os.ReadFile(filepath.Join(w.Path, ".git"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			admin := strings.TrimSpace(strings.TrimPrefix(string(pointer), "gitdir: "))
+			modules := filepath.Join(admin, "modules")
+			if kind == "symlink" {
+				outside := t.TempDir()
+				hostWrite(t, filepath.Join(outside, "important"), "keep")
+				if err := os.Symlink(outside, modules); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Mkdir(modules, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "nonempty" {
+					hostWrite(t, filepath.Join(modules, "important"), "keep")
+				}
+			}
+			err = f.run(t, "remove", "topic")
+			if kind == "empty" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if f.load(t, "topic").Stage != "removed" {
+					t.Fatal("empty modules blocked native cleanup")
+				}
+			} else {
+				if err == nil {
+					t.Fatal("unsafe modules directory removed")
+				}
+				checkFile(t, filepath.Join(modules, "important"), "keep")
+				if _, err := os.Stat(w.Path); err != nil {
+					t.Fatal("worktree lost with unsafe modules")
+				}
+			}
+		})
 	}
 }

@@ -1,0 +1,26 @@
+# Selected config behavior from upstream 2be0294cb5fc06ddbfa9a0dbb138a95ef81b61b3.
+panes: &panes
+  - name: editor
+    command: "echo '<global>' '<agent>'"
+    focus: true
+  - split: horizontal
+    target: 0
+    size: 0
+    focus: true
+  - split: vertical
+    percentage: 100
+    zoom: true
+layouts:
+  aliased:
+    panes: *panes
+  empty:
+    panes: []
+  explicit:
+    panes:
+      - command: explicit-shell
+files:
+  copy: null
+post_create: ['echo <global>', "echo 'literal <agent> text'", '']
+pre_merge: null
+sandbox:
+  enabled: null

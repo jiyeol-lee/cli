@@ -45,6 +45,9 @@ type cleanupJob struct {
 }
 
 func validateCleanupState(w Workspace, removal *removalState) error {
+	if err := validateRecovery(removal); err != nil {
+		return err
+	}
 	if saved := removal.Identity; saved != nil {
 		if filepath.Dir(saved.AdminPath) != filepath.Join(w.CommonDir, "worktrees") || !filepath.IsAbs(saved.AdminPath) || filepath.Clean(saved.AdminPath) != saved.AdminPath {
 			return fmt.Errorf("invalid captured Git administration path")
@@ -56,6 +59,13 @@ func validateCleanupState(w Workspace, removal *removalState) error {
 		}
 	}
 	if job := removal.Job; job != nil {
+		seen := map[string]bool{job.Window.ID: true}
+		for _, other := range job.Window.Others {
+			if len(other.Others) != 0 || !tmuxID(other.ID, '@') || seen[other.ID] || other.Token != job.Token || other.Socket != job.Window.Socket || other.ServerPID != job.Window.ServerPID || other.SocketDevice != job.Window.SocketDevice || other.SocketInode != job.Window.SocketInode {
+				return fmt.Errorf("invalid duplicate cleanup window identity")
+			}
+			seen[other.ID] = true
+		}
 		if !validID(job.Token) || job.Deadline <= 0 || job.Window.Token != job.Token {
 			return fmt.Errorf("invalid cleanup handoff token")
 		}
@@ -73,7 +83,7 @@ func validateCleanupState(w Workspace, removal *removalState) error {
 				return fmt.Errorf("cleanup capture conflicts with the saved tmux server identity")
 			}
 		}
-		if !removal.HookDone || removal.Identity == nil && !removal.WorktreeRemoved {
+		if !removal.HookDone || removal.Identity == nil && removal.Recovery == nil && !removal.WorktreeRemoved {
 			return fmt.Errorf("cleanup handoff lacks completed hooks or filesystem identity")
 		}
 		switch job.Status {
@@ -173,6 +183,13 @@ func cleanupActive(job *cleanupJob) bool {
 	return job != nil && (job.Status == "queued" || job.Status == "armed" || job.Status == "running") && time.Now().UnixNano() < job.Deadline
 }
 
+func verifyRemovalIdentity(state workspaceState) error {
+	if recovery := state.Removal.Recovery; recovery != nil {
+		return verifyRecovery(state.Workspace, recovery)
+	}
+	return verifyCleanupIdentity(state.Workspace, state.Removal.Identity, state.Removal.WorktreeRemoved)
+}
+
 func cleanupLogPath(store *stateStore, id, token string) string {
 	return filepath.Join(store.dir, id+"."+token+".cleanup.log")
 }
@@ -212,21 +229,30 @@ func cleanupDiagnostic(file *os.File, phase string) error {
 }
 
 func (app *App) cleanup(ctx context.Context, g gitHost, repo gitRepository, store *stateStore, state *workspaceState, merged bool) (resultErr error) {
-	removal := state.Removal
-	if err := verifyCleanupIdentity(state.Workspace, removal.Identity, removal.WorktreeRemoved); err != nil {
+	if err := app.checkStandalone(ctx, state.Workspace); err != nil {
 		return err
 	}
-	if removal.Job != nil && state.ServerPID == 0 && (removal.Job.Window.ID != "" || state.Window != "" || state.Socket != "") {
-		if _, err := app.Mux.CapturedExists(ctx, state.Workspace, removal.Job.Window); err != nil {
-			return fmt.Errorf("legacy cleanup lacks a trusted tmux server identity; restore the original connection or recover the record manually after confirming its window/server is closed: %w", err)
-		}
+	removal := state.Removal
+	if err := verifyRemovalIdentity(*state); err != nil {
+		return err
+	}
+	if err := app.checkCleanupWindow(ctx, *state); err != nil {
+		return err
 	}
 	var random [16]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return err
 	}
 	token := hex.EncodeToString(random[:])
-	window, err := app.Mux.Capture(ctx, state.Workspace, token)
+	var window CleanupWindow
+	var err error
+	if mux, ok := app.Mux.(interface {
+		CaptureAll(context.Context, Workspace, string) (CleanupWindow, error)
+	}); ok {
+		window, err = mux.CaptureAll(ctx, state.Workspace, token)
+	} else {
+		window, err = app.Mux.Capture(ctx, state.Workspace, token)
+	}
 	if err != nil {
 		return err
 	}
@@ -275,6 +301,17 @@ func (app *App) cleanup(ctx context.Context, g gitHost, repo gitRepository, stor
 		if err := app.Spawner.Start(ctx, launch); err != nil {
 			return fail("handoff_failed", err)
 		}
+		cancelled := func() error {
+			if err := ctx.Err(); err != nil {
+				job.Status = "cancelled"
+				diagnose("handoff_cancelled")
+				return errors.Join(err, store.save(*state))
+			}
+			return nil
+		}
+		if err := cancelled(); err != nil {
+			return err
+		}
 		message := "cleanup scheduled"
 		if merged {
 			message = "merge succeeded; cleanup scheduled"
@@ -283,11 +320,17 @@ func (app *App) cleanup(ctx context.Context, g gitHost, repo gitRepository, stor
 			return fail("handoff_failed", err)
 		}
 		// A broken stdout may terminate this process with SIGPIPE instead of returning an error.
+		if err := cancelled(); err != nil {
+			return err
+		}
 		job.Status = "armed"
 		if err := store.save(*state); err != nil {
 			return fail("handoff_failed", err)
 		}
 		diagnose("armed")
+		if err := cancelled(); err != nil {
+			return err
+		}
 		app.cleanupScheduled = true
 		return store.unlock()
 	}
@@ -299,6 +342,19 @@ func (app *App) cleanup(ctx context.Context, g gitHost, repo gitRepository, stor
 		return fail(phase, err)
 	}
 	diagnose("complete")
+	return nil
+}
+
+func (app *App) checkCleanupWindow(ctx context.Context, state workspaceState) error {
+	removal := state.Removal
+	if removal != nil && removal.Job != nil && state.ServerPID == 0 && (removal.Job.Window.ID != "" || removal.Job.Window.Socket != "" || state.Window != "" || state.Socket != "") {
+		if state.Socket == "" && removal.Job.Window.Socket != "" {
+			return fmt.Errorf("legacy cleanup lacks a trusted tmux server identity; its captured socket must not be discarded")
+		}
+		if _, err := app.Mux.CapturedExists(ctx, state.Workspace, removal.Job.Window); err != nil {
+			return fmt.Errorf("legacy cleanup lacks a trusted tmux server identity; restore the original connection or recover the record manually after confirming its window/server is closed: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -336,10 +392,18 @@ func cleanupPause(ctx context.Context, delay time.Duration) error {
 
 func (app *App) executeCleanup(ctx context.Context, g gitHost, repo gitRepository, store *stateStore, state *workspaceState) (string, error) {
 	r := state.Removal
-	if err := verifyCleanupIdentity(state.Workspace, r.Identity, r.WorktreeRemoved); err != nil {
+	if r.LegacyKeepBranch {
+		return "legacy_authorization_failed", fmt.Errorf("unfinished legacy branch-preserving cleanup; recover it with the previous workmux implementation before retrying")
+	}
+	if err := verifyRemovalIdentity(*state); err != nil {
 		return "identity_failed", err
 	}
-	if state.Config.Sandbox.Enabled {
+	if r.Recovery != nil {
+		if err := g.orphanStillMissing(ctx, repo, state.Workspace, r.Recovery); err != nil {
+			return "identity_failed", err
+		}
+	}
+	if workspaceHasSandbox(state.Workspace) && (r.Recovery == nil || expectedContainer(state.Workspace)) {
 		if app.Sandbox == nil {
 			return "sandbox_stop_failed", fmt.Errorf("saved sandbox implementation is unavailable")
 		}
@@ -363,6 +427,9 @@ func (app *App) executeCleanup(ctx context.Context, g gitHost, repo gitRepositor
 	if err := store.save(*state); err != nil {
 		return "checkpoint_failed", err
 	}
+	if r.Recovery != nil {
+		return app.finishOrphan(ctx, g, repo, store, state)
+	}
 	if err := verifyCleanupIdentity(state.Workspace, r.Identity, r.WorktreeRemoved); err != nil {
 		return "identity_failed", err
 	}
@@ -374,7 +441,7 @@ func (app *App) executeCleanup(ctx context.Context, g gitHost, repo gitRepositor
 		if source.Head != r.Head {
 			return "source_validation_failed", fmt.Errorf("source ref changed during cleanup; worktree and branch preserved")
 		}
-		if _, err := app.removalCheck(ctx, g, repo, *state, source, r.Force, r.KeepBranch); err != nil {
+		if _, err := app.removalCheck(ctx, g, repo, *state, source); err != nil {
 			return "worktree_validation_failed", err
 		}
 		if err := verifyCleanupIdentity(state.Workspace, r.Identity, false); err != nil {
@@ -390,13 +457,26 @@ func (app *App) executeCleanup(ctx context.Context, g gitHost, repo gitRepositor
 		if err := store.save(*state); err != nil {
 			return "checkpoint_failed", err
 		}
-		args := []string{"worktree", "remove"}
-		if r.Force {
-			args = append(args, "--force")
+		checked, err := g.source(ctx, repo, state.Workspace)
+		if err != nil {
+			return "source_validation_failed", err
 		}
+		if checked.Head != r.Head {
+			return "source_validation_failed", fmt.Errorf("source changed before Git removal; work preserved")
+		}
+		if err := verifyCleanupIdentity(state.Workspace, r.Identity, false); err != nil {
+			return "identity_failed", err
+		}
+		if _, err := app.removalCheck(ctx, g, repo, *state, checked); err != nil {
+			return "worktree_validation_failed", err
+		}
+		if err := removeEmptyModules(state.Workspace, r.Identity); err != nil {
+			return "modules_validation_failed", err
+		}
+		args := []string{"worktree", "remove"}
 		args = append(args, "--", state.Path)
 		if _, err := g.run(ctx, repo.Root, args...); err != nil {
-			return "worktree_remove_failed", err
+			return "worktree_remove_failed", fmt.Errorf("native Git removal refused; worktree preserved; inspect changes or move preserved untracked files out, then retry remove: %w", err)
 		}
 		r.WorktreeRemoved = true
 		if err := store.save(*state); err != nil {
@@ -404,17 +484,15 @@ func (app *App) executeCleanup(ctx context.Context, g gitHost, repo gitRepositor
 		}
 	}
 	if !r.BranchDeleted {
-		if !r.KeepBranch {
-			if err := app.deleteBranch(ctx, g, repo, *state); err != nil {
-				return "branch_remove_failed", err
-			}
+		if err := app.deleteBranch(ctx, g, repo, *state); err != nil {
+			return "branch_remove_failed", err
 		}
 		r.BranchDeleted = true
 		if err := store.save(*state); err != nil {
 			return "checkpoint_failed", err
 		}
 	}
-	if !r.ContainerRemoved && state.Config.Sandbox.Enabled {
+	if !r.ContainerRemoved && workspaceHasSandbox(state.Workspace) {
 		if err := app.Sandbox.Remove(ctx, state.Workspace); err != nil {
 			return "container_remove_failed", err
 		}
@@ -423,14 +501,67 @@ func (app *App) executeCleanup(ctx context.Context, g gitHost, repo gitRepositor
 	r.Job.Status = "complete"
 	completed := *state
 	completed.Stage, completed.Config, completed.Container = "removed", Config{}, ""
+	completed.SandboxUsed = false
 	completed.OwnedIgnored = nil
 	completed.PendingMergeCommit, completed.PendingMergeTarget = "", ""
+	completed.PendingMergeHead, completed.PendingMergePath, completed.RetryMergeTarget = "", "", ""
+	completed.PendingSquashTree = ""
+	completed.PendingConflict = false
 	if err := store.save(completed); err != nil {
 		r.Job.Status = "running"
 		return "checkpoint_failed", err
 	}
 	*state = completed
 	return "complete", nil
+}
+
+func removeEmptyModules(w Workspace, saved *cleanupIdentity) error {
+	if err := verifyCleanupIdentity(w, saved, false); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(saved.AdminPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	info, err := root.Stat(".")
+	if err != nil {
+		return err
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	if (fileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}) != saved.Admin {
+		return fmt.Errorf("worktree administration directory changed before empty modules cleanup")
+	}
+	// Sandbox protection may have created this empty directory. Git refuses
+	// native removal even when no submodule repository has ever existed there.
+	modules, err := root.OpenFile("modules", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect worktree modules without following symlinks: %w", err)
+	}
+	defer func() { _ = modules.Close() }()
+	opened, err := modules.Stat()
+	if err != nil {
+		return err
+	}
+	_, err = modules.ReadDir(1)
+	if err == nil {
+		return nil
+	}
+	if err != io.EOF {
+		return err
+	}
+	current, err := root.Lstat("modules")
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(opened, current) {
+		return fmt.Errorf("worktree modules directory changed; replacement preserved")
+	}
+	// Removing an empty directory is atomic and refuses newly added contents.
+	return root.Remove("modules")
 }
 
 func ParseCleanupCommand(args []string) (CleanupCommand, error) {
@@ -640,7 +771,7 @@ func (app App) RunCleanup(ctx context.Context, command CleanupCommand, ready io.
 		diagnose("stale_handoff")
 		return fmt.Errorf("cleanup is not queued or its handoff expired")
 	}
-	if err := verifyCleanupIdentity(state.Workspace, state.Removal.Identity, state.Removal.WorktreeRemoved); err != nil {
+	if err := verifyRemovalIdentity(state); err != nil {
 		diagnose("identity_failed")
 		return err
 	}
@@ -711,7 +842,7 @@ func (app App) RunCleanup(ctx context.Context, command CleanupCommand, ready io.
 		}
 		return err
 	}
-	if err := verifyCleanupIdentity(state.Workspace, state.Removal.Identity, state.Removal.WorktreeRemoved); err != nil {
+	if err := verifyRemovalIdentity(state); err != nil {
 		return fail("identity_failed", err)
 	}
 	g := gitHost{runner: app.Runner}
