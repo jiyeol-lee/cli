@@ -30,10 +30,21 @@ func TestParseCommand(t *testing.T) {
 		{"remove", []string{"remove", "--keep-branch", "topic", "--force"}, Command{Kind: "remove", Name: "topic", KeepBranch: true, Force: true}},
 		{"end options", []string{"open", "--", "topic"}, Command{Kind: "open", Name: "topic"}},
 		{"implicit close", []string{"close"}, Command{Kind: "close"}},
+		{"multiple open", []string{"open", "one", "two", "-n", "--run-hooks", "--force-files"}, Command{Kind: "open", Name: "one", Names: []string{"one", "two"}, New: true, RunHooks: true, ForceFiles: true}},
+		{"multiple remove aliases", []string{"rm", "one", "two", "-f", "-k"}, Command{Kind: "remove", Name: "one", Names: []string{"one", "two"}, Force: true, KeepBranch: true}},
+		{"add overrides", []string{"add", "topic", "-o", "-H", "-F", "-C", "--name", "custom"}, Command{Kind: "add", Name: "topic", Handle: "custom", OpenIfExists: true, NoHooks: true, NoFileOps: true, NoPaneCmds: true}},
+		{"rebase cleanup", []string{"merge", ".", "--rebase", "--cleanup", "--no-verify"}, Command{Kind: "merge", Name: ".", Rebase: true, Cleanup: true, NoVerify: true}},
+		{"squash keep", []string{"merge", "topic", "--squash", "-k"}, Command{Kind: "merge", Name: "topic", Squash: true, Keep: true}},
+		{"add no hooks long", []string{"add", "topic", "--no-hooks"}, Command{Kind: "add", Name: "topic", NoHooks: true}},
+		{"merge no hooks long", []string{"merge", "topic", "--no-hooks"}, Command{Kind: "merge", Name: "topic", NoHooks: true}},
+		{"merge no hooks short", []string{"merge", "topic", "-H"}, Command{Kind: "merge", Name: "topic", NoHooks: true}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := ParseCommand(test.args)
-			if err != nil || got != test.want {
+			if test.want.Name != "" && test.want.Names == nil {
+				test.want.Names = []string{test.want.Name}
+			}
+			if err != nil || !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("ParseCommand(%q) = %+v, %v; want %+v", test.args, got, err, test.want)
 			}
 		})
@@ -47,12 +58,57 @@ func TestParseCommand(t *testing.T) {
 		{"add", "topic", "-b", "--background"}, {"merge", "--into", "-bad"},
 		{"add", "--", "-bad"}, {"add", "one\ntwo"}, {"add", ""},
 		{"add", "topic", "--base", "@{-1}"}, {"add", "topic", "--wat"},
+		{"merge", "topic", "--rebase", "--squash"}, {"merge", "topic", "--cleanup", "--keep"},
+		{"remove", "topic", "--no-hooks"}, {"remove", "topic", "-H"},
+		{"rm", "topic", "--no-hooks"}, {"rm", "topic", "-H"},
+		{"remove", "--no-hooks"}, {"rm", "-H", "topic"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			if _, err := ParseCommand(args); err == nil || !strings.HasPrefix(err.Error(), "usage: cli workmux") {
 				t.Fatalf("expected usage error for %q, got %v", args, err)
 			}
 		})
+	}
+}
+
+func TestUsageLimitsNoHooksToAddAndMerge(t *testing.T) {
+	if strings.Count(Usage, "[-H|--no-hooks]") != 2 {
+		t.Fatal("help must advertise hook suppression only for add and merge")
+	}
+	for line := range strings.SplitSeq(Usage, "\n") {
+		if strings.Contains(line, "remove|rm") && strings.Contains(line, "no-hooks") {
+			t.Fatal("help advertises unsupported remove hook suppression")
+		}
+	}
+}
+
+func TestMergeNoHooksSurvivesCleanupWorkerHandoff(t *testing.T) {
+	f := newHostFixture(t, "pre_merge: [must-not-run]\npre_remove: [must-not-run]\n")
+	if err := f.run(t, "add", "topic", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	f.runner.hook = func(Process) error { t.Fatal("merge --no-hooks ran a lifecycle hook"); return nil }
+	f.mux.caller = true
+	var launch CleanupLaunch
+	f.app.Spawner = cleanupSpawnFunc(func(_ context.Context, captured CleanupLaunch) error { launch = captured; return nil })
+	if err := f.run(t, "merge", "topic", "--no-hooks"); err != nil {
+		t.Fatal(err)
+	}
+	state := f.load(t, "topic")
+	if state.Removal == nil || state.Removal.Job == nil || !state.Removal.HookDone || len(state.Config.PreRemove) != 0 {
+		t.Fatalf("handoff lost hook suppression: %+v", state)
+	}
+	state.Removal.Job.Status = "queued"
+	savePolicyState(t, f, state)
+	if err := f.app.RunCleanup(t.Context(), launch.Command, cleanupReadyFunc(func(data []byte) (int, error) {
+		state.Removal.Job.Status = "armed"
+		savePolicyState(t, f, state)
+		return len(data), nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if state := f.load(t, "topic"); state.Stage != "removed" {
+		t.Fatalf("worker did not complete cleanup: %+v", state)
 	}
 }
 
@@ -103,6 +159,7 @@ type hostTestMux struct {
 	events                                      *[]string
 	window                                      string
 	sessionErr, createErr, closeErr, quiesceErr error
+	findErr                                     error
 	panes                                       []Pane
 	commands                                    [][]string
 	onCreate, onClose                           func(Workspace)
@@ -117,7 +174,7 @@ func (mux *hostTestMux) Server(context.Context) (string, error) { return "/fake/
 
 func (mux *hostTestMux) Find(context.Context, Workspace) (string, error) {
 	*mux.events = append(*mux.events, "mux:find")
-	return mux.window, nil
+	return mux.window, mux.findErr
 }
 
 func (mux *hostTestMux) Create(_ context.Context, _ string, w Workspace, panes []Pane, commands [][]string) (string, error) {
@@ -162,10 +219,13 @@ func (mux *hostTestMux) CapturedExists(_ context.Context, w Workspace, window Cl
 	if mux.onExists != nil {
 		return mux.onExists(w, window)
 	}
+	if mux.window == "" {
+		return false, nil
+	}
 	if window.Token != mux.cleanupToken {
 		return false, fmt.Errorf("stale captured window")
 	}
-	return mux.window != "", nil
+	return true, nil
 }
 
 func (mux *hostTestMux) Close(_ context.Context, w Workspace) error {
@@ -182,6 +242,9 @@ func (mux *hostTestMux) Close(_ context.Context, w Workspace) error {
 type hostTestSandbox struct {
 	events                              *[]string
 	checkErr, ensureErr, stopErr, rmErr error
+	existsErr                           error
+	paneErr                             error
+	present                             bool
 	exec                                func(Workspace, string, []string) error
 }
 
@@ -192,7 +255,15 @@ func (sandbox *hostTestSandbox) Check(context.Context, SandboxConfig) error {
 
 func (sandbox *hostTestSandbox) Ensure(context.Context, Workspace) error {
 	*sandbox.events = append(*sandbox.events, "sandbox:ensure")
+	if sandbox.ensureErr == nil {
+		sandbox.present = true
+	}
 	return sandbox.ensureErr
+}
+
+func (sandbox *hostTestSandbox) Exists(context.Context, Workspace) (bool, error) {
+	*sandbox.events = append(*sandbox.events, "sandbox:exists")
+	return sandbox.present, sandbox.existsErr
 }
 
 func (sandbox *hostTestSandbox) Exec(_ context.Context, w Workspace, command string, env []string, _ io.Reader, _, _ io.Writer) error {
@@ -203,8 +274,11 @@ func (sandbox *hostTestSandbox) Exec(_ context.Context, w Workspace, command str
 	return nil
 }
 
-func (*hostTestSandbox) PaneCommand(w Workspace, command string) []string {
-	return []string{"podman", "exec", w.Container, "sh", "-lc", command}
+func (sandbox *hostTestSandbox) PaneCommand(_ context.Context, w Workspace, command string) ([]string, error) {
+	if sandbox.paneErr != nil {
+		return nil, sandbox.paneErr
+	}
+	return []string{"podman", "run", "--rm", "test-image", "bash", "-c", command}, nil
 }
 
 func (sandbox *hostTestSandbox) Stop(context.Context, Workspace) error {
@@ -214,6 +288,9 @@ func (sandbox *hostTestSandbox) Stop(context.Context, Workspace) error {
 
 func (sandbox *hostTestSandbox) Remove(context.Context, Workspace) error {
 	*sandbox.events = append(*sandbox.events, "sandbox:remove")
+	if sandbox.rmErr == nil {
+		sandbox.present = false
+	}
 	return sandbox.rmErr
 }
 
@@ -295,7 +372,7 @@ func (f *hostFixture) run(t *testing.T, args ...string) error {
 
 func (f *hostFixture) load(t *testing.T, name string) workspaceState {
 	t.Helper()
-	path := workspacePath(f.root, strings.ReplaceAll(name, "/", "-"))
+	path := workspacePath(f.root, workspaceSlug(name))
 	common := filepath.Join(f.root, ".git")
 	state, err := readState(filepath.Join(f.state, identity(common), identity(common, path)+".json"))
 	if err != nil {
@@ -312,7 +389,208 @@ func hostEventBefore(t *testing.T, events []string, before, after string) {
 	}
 }
 
-func TestHostAddOpenCloseUseSavedLayout(t *testing.T) {
+func TestHostAdoptsPlainGitWorktreeAtActualPath(t *testing.T) {
+	f := newHostFixture(t, "pre_remove: [fresh-check]\n")
+	path := filepath.Join(t.TempDir(), "borrowed-directory")
+	hostGit(t, f.root, "worktree", "add", "-b", "feature/manual", path)
+	hostGit(t, f.root, "config", "branch.feature/manual.workmux-base", "main")
+	if err := f.run(t, "open", "feature/manual"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := readState(filepath.Join(f.state, identity(filepath.Join(f.root, ".git")), identity(filepath.Join(f.root, ".git"), path)+".json"))
+	if err != nil || state.Path != path || state.BaseRef != "main" {
+		t.Fatalf("adopted state = %+v, %v", state, err)
+	}
+	hostGit(t, path, "branch", "-m", "feature/renamed")
+	if err := f.run(t, "remove", "feature/renamed", "-k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("actual worktree not removed: %v", err)
+	}
+	if got := hostGit(t, f.root, "rev-parse", "feature/renamed"); got == "" {
+		t.Fatal("branch was not kept")
+	}
+}
+
+func TestHostNormalizedNamesAndLegacyHandles(t *testing.T) {
+	f := newHostFixture(t, "")
+	if err := f.run(t, "add", "Feature/Auth_OAuth", "--name", "My Cool Feature", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	path := workspacePath(f.root, "my-cool-feature")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("name override was not slugified", err)
+	}
+	if err := f.run(t, "open", "my-cool-feature"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "remove", "Feature/Auth_OAuth", "-k"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "add", "other", "--name", "!!!", "-b"); err == nil {
+		t.Fatal("accepted an empty slug")
+	}
+	legacy := "Feature_Name"
+	path = workspacePath(f.root, legacy)
+	hostGit(t, f.root, "worktree", "add", "-b", legacy, path)
+	common := filepath.Join(f.root, ".git")
+	state := workspaceState{Workspace: Workspace{ID: identity(common, path), RepoID: identity(common), Root: f.root, CommonDir: common, Path: path, Branch: legacy, Handle: legacy, Stage: "ready"}}
+	store := hostStateStore(t, f)
+	if err := store.save(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "open", legacy); err != nil {
+		t.Fatal(err)
+	}
+	state, err := readState(filepath.Join(store.dir, state.ID+".json"))
+	if err != nil || state.Path != path || state.Handle != legacy {
+		t.Fatalf("legacy identity was renamed: %+v, %v", state, err)
+	}
+	f.app.Getwd = func() (string, error) { return path, nil }
+	if err := f.run(t, "remove", ".", "-k"); err != nil {
+		t.Fatal("current-directory shorthand failed", err)
+	}
+}
+
+func TestHostMergeStagedCommitUsesEditorAndKeepsPartialChanges(t *testing.T) {
+	f := newHostFixture(t, "")
+	editor := filepath.Join(t.TempDir(), "editor")
+	marker := filepath.Join(t.TempDir(), "edited")
+	script := "#!/bin/bash\nprintf '%s\\n' 'staged through editor' > \"$1\"\nprintf yes > " + shellQuote(marker, "sh") + "\n"
+	if err := os.WriteFile(editor, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	hostGit(t, f.root, "config", "core.editor", editor)
+	if err := f.run(t, "add", "topic", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	w := f.load(t, "topic")
+	hostWrite(t, filepath.Join(w.Path, "tracked"), "staged\n")
+	hostGit(t, w.Path, "add", "tracked")
+	hostWrite(t, filepath.Join(w.Path, "tracked"), "unstaged\n")
+	hostWrite(t, filepath.Join(w.Path, "untracked"), "local\n")
+	if err := f.run(t, "merge", "topic"); err == nil {
+		t.Fatal("normal merge discarded unstaged changes")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("editor ran before unstaged check")
+	}
+	if err := f.run(t, "merge", "topic", "-k"); err != nil {
+		t.Fatal(err)
+	}
+	if got := hostGit(t, f.root, "show", "HEAD:tracked"); got != "staged" {
+		t.Fatalf("merged %q instead of index", got)
+	}
+	if got := hostGit(t, w.Path, "log", "-1", "--format=%s"); got != "staged through editor" {
+		t.Fatalf("editor not honored: %q", got)
+	}
+	if data, err := os.ReadFile(filepath.Join(w.Path, "tracked")); err != nil || string(data) != "unstaged\n" {
+		t.Fatalf("partial change lost: %q, %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(w.Path, "untracked")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHostIgnoredPreRemoveOutputDoesNotBlockMergeCleanup(t *testing.T) {
+	f := newHostFixture(t, "pre_remove: [build]\n")
+	if err := f.run(t, "add", "topic", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	w := f.load(t, "topic")
+	f.runner.hook = func(Process) error { hostWrite(t, filepath.Join(w.Path, ".env"), "build output\n"); return nil }
+	if err := f.run(t, "merge", "topic"); err != nil {
+		t.Fatal(err)
+	}
+	if state := f.load(t, "topic"); state.Stage != "removed" {
+		t.Fatalf("cleanup stuck: %+v", state)
+	}
+}
+
+func TestHostSandboxEnabledWithoutAgentNeedsNoRuntime(t *testing.T) {
+	f := newHostFixture(t, "sandbox: {enabled: true}\npanes: [{command: nvim}, {split: vertical}]\n")
+	f.app.Sandbox = nil
+	if err := f.run(t, "add", "topic", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "close", "topic"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "remove", "topic"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHostAddFlagsAndDryRun(t *testing.T) {
+	f := newHostFixture(t, "post_create: [fail]\nfiles: {copy: [.env]}\npanes: [{command: opencode}]\nsandbox: {enabled: true}\n")
+	f.app.Sandbox = nil
+	hostWrite(t, filepath.Join(f.root, ".env"), "secret")
+	if err := f.run(t, "add", "topic", "--dry-run"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(f.state); !os.IsNotExist(err) {
+		t.Fatal("dry run created state")
+	}
+	if got := hostGit(t, f.root, "for-each-ref", "--format=%(refname)", "refs/heads/topic"); got != "" {
+		t.Fatal("dry run created branch")
+	}
+	if err := f.run(t, "add", "topic", "-H", "-F", "-C", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	w := f.load(t, "topic")
+	if _, err := os.Stat(filepath.Join(w.Path, ".env")); !os.IsNotExist(err) {
+		t.Fatal("--no-file-ops copied data")
+	}
+	if len(f.mux.commands[0]) != 0 || slices.Contains(f.events, "hook:fail") {
+		t.Fatalf("suppressed setup ran: %q %q", f.events, f.mux.commands)
+	}
+	if err := f.run(t, "add", "topic", "-o"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedPaneGeometryPrecedesProvisioning(t *testing.T) {
+	for _, kind := range []string{"add", "open", "open-if-exists"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newHostFixture(t, "panes: [{}]\n")
+			if kind != "add" {
+				if err := f.run(t, "add", "topic", "-b"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hostWrite(t, filepath.Join(f.root, ".env"), "source data\n")
+			hostWrite(t, filepath.Join(f.config, "config.yaml"), "panes: [{}, {}]\nfiles: {copy: [.env]}\npost_create: [must-not-run]\n")
+			if _, err := LoadConfigForRepo(f.config, f.root); err != nil {
+				t.Fatal("geometry was not deferred to selection", err)
+			}
+			f.events = nil
+			args := []string{"add", "topic", "-b"}
+			if kind == "open" {
+				args = []string{"open", "topic", "--force-files", "--run-hooks"}
+			}
+			if kind == "open-if-exists" {
+				args = append(args, "--open-if-exists")
+			}
+			if err := f.run(t, args...); err == nil || !strings.Contains(err.Error(), "split") {
+				t.Fatalf("invalid selected geometry was accepted: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(workspacePath(f.root, "topic"), ".env")); !os.IsNotExist(err) {
+				t.Fatalf("files were copied before validating panes: %v", err)
+			}
+			for _, event := range f.events {
+				if strings.HasPrefix(event, "git:") || strings.HasPrefix(event, "hook:") || event == "mux:create" || event == "mux:focus" {
+					t.Fatalf("invalid pane geometry caused side effects: %q", f.events)
+				}
+			}
+		})
+	}
+}
+
+func TestHostAddLayoutAndOpenFreshPanes(t *testing.T) {
 	f := newHostFixture(t, "post_create: [created]\nlayouts:\n  dev:\n    panes:\n      - command: editor\n      - command: tests\n        split: vertical\n")
 	f.mux.onCreate = func(w Workspace) {
 		if state := f.load(t, w.Branch); state.Stage != "ready" {
@@ -354,15 +632,15 @@ func TestHostAddOpenCloseUseSavedLayout(t *testing.T) {
 	if err := f.run(t, "close", "feature-topic"); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.run(t, "close", "feature-topic"); err != nil {
-		t.Fatal(err)
+	if err := f.run(t, "close", "feature-topic"); err == nil {
+		t.Fatal("closing an absent window must report an error")
 	}
 	hostWrite(t, filepath.Join(f.config, "config.yaml"), "post_create: [changed]\npanes: [{command: new}]\n")
 	if err := f.run(t, "open", "feature/topic"); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.mux.panes) != 2 || f.mux.panes[0].Command != "editor" {
-		t.Fatalf("open did not use saved layout: %+v", f.mux.panes)
+	if len(f.mux.panes) != 1 || f.mux.panes[0].Command != "new" {
+		t.Fatalf("open did not use fresh panes: %+v", f.mux.panes)
 	}
 	if count := len(slices.DeleteFunc(slices.Clone(f.events), func(event string) bool { return !strings.HasPrefix(event, "hook:") })); count != 1 {
 		t.Fatalf("open/close reran provisioning hooks: %q", f.events)
@@ -420,7 +698,7 @@ func TestHostPreflightAndPartialAdd(t *testing.T) {
 		setup                   func(*hostFixture)
 	}{
 		{"tmux", "", "", func(f *hostFixture) { f.mux.sessionErr = fmt.Errorf("not in tmux") }},
-		{"sandbox preflight", "sandbox: {enabled: true}\n", "", func(f *hostFixture) { f.sandbox.checkErr = fmt.Errorf("missing image") }},
+		{"sandbox preflight", "sandbox: {enabled: true}\npanes: [{command: opencode}]\n", "ready", func(f *hostFixture) { f.sandbox.checkErr = fmt.Errorf("missing image") }},
 		{"worktree failure", "", "planned", func(f *hostFixture) {
 			f.runner.git = func(p Process) error {
 				args := hostGitArgs(p)
@@ -433,7 +711,7 @@ func TestHostPreflightAndPartialAdd(t *testing.T) {
 				return nil
 			}
 		}},
-		{"sandbox ensure", "sandbox: {enabled: true}\n", "files", func(f *hostFixture) { f.sandbox.ensureErr = fmt.Errorf("cannot start") }},
+		{"sandbox ensure", "sandbox: {enabled: true}\npanes: [{command: opencode}]\n", "ready", func(f *hostFixture) { f.sandbox.ensureErr = fmt.Errorf("cannot start") }},
 		{"hook", "post_create: [fail]\n", "sandbox", func(f *hostFixture) { f.runner.hook = func(Process) error { return fmt.Errorf("failed") } }},
 		{"panes", "", "ready", func(f *hostFixture) { f.mux.createErr = fmt.Errorf("cannot split") }},
 	} {
@@ -467,7 +745,7 @@ func TestHostNamesOnlyImplicitInsideManagedTree(t *testing.T) {
 	if err := f.run(t, "add", "topic", "-b"); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.run(t, "open"); err == nil {
+	if _, err := ParseCommand([]string{"open"}); err == nil {
 		t.Fatal("guessed a workspace from main")
 	}
 	state := f.load(t, "topic")
@@ -476,13 +754,13 @@ func TestHostNamesOnlyImplicitInsideManagedTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.app.Getwd = func() (string, error) { return dir, nil }
-	if err := f.run(t, "open"); err != nil {
+	if err := f.run(t, "open", "--new"); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestHostSandboxHooksAndChangedConfig(t *testing.T) {
-	f := newHostFixture(t, "sandbox: {enabled: true}\npost_create: [created]\npre_merge: [mergecheck]\npre_remove: [removecheck]\n")
+	f := newHostFixture(t, "sandbox: {enabled: true}\npanes: [{command: opencode}]\npost_create: [created]\npre_merge: [mergecheck]\npre_remove: [removecheck]\n")
 	f.sandbox.exec = func(w Workspace, command string, env []string) error {
 		if !slices.Contains(env, "WM_WORKTREE_PATH="+w.Path) || !slices.Contains(env, "WM_BRANCH_NAME="+w.Branch) {
 			t.Fatalf("missing hook environment: %q", env)
@@ -492,9 +770,9 @@ func TestHostSandboxHooksAndChangedConfig(t *testing.T) {
 	if err := f.run(t, "add", "topic", "-b"); err != nil {
 		t.Fatal(err)
 	}
-	hostEventBefore(t, f.events, "sandbox:check", "git:worktree add")
-	hostEventBefore(t, f.events, "sandbox:ensure", "sandbox:hook:created")
-	hostEventBefore(t, f.events, "sandbox:hook:created", "mux:create")
+	hostEventBefore(t, f.events, "git:worktree add", "sandbox:check")
+	hostEventBefore(t, f.events, "hook:created", "sandbox:ensure")
+	hostEventBefore(t, f.events, "hook:created", "mux:create")
 	if f.mux.commands[0][0] != "podman" {
 		t.Fatalf("sandbox pane fell back to host: %q", f.mux.commands)
 	}
@@ -503,20 +781,20 @@ func TestHostSandboxHooksAndChangedConfig(t *testing.T) {
 		t.Fatal("open should only focus its existing window", err)
 	}
 	f.sandbox.ensureErr = nil
-	hostWrite(t, filepath.Join(f.config, "config.yaml"), "sandbox: {enabled: false}\n")
-	if err := f.run(t, "open", "topic"); err == nil || !strings.Contains(err.Error(), "configuration changed") {
-		t.Fatalf("expected sandbox drift rejection, got %v", err)
+	hostWrite(t, filepath.Join(f.config, "config.yaml"), "sandbox: {enabled: false}\npre_remove: [freshremove]\n")
+	if err := f.run(t, "open", "topic"); err != nil {
+		t.Fatalf("config changes must not block focus, got %v", err)
 	}
 	if err := f.run(t, "merge", "topic"); err != nil {
 		t.Fatal(err)
 	}
-	hostEventBefore(t, f.events, "sandbox:hook:removecheck", "sandbox:stop")
+	hostEventBefore(t, f.events, "hook:freshremove", "sandbox:stop")
 	hostEventBefore(t, f.events, "sandbox:stop", "git:worktree remove")
 	hostEventBefore(t, f.events, "git:worktree remove", "sandbox:remove")
 	hostEventBefore(t, f.events, "mux:close", "git:worktree remove")
 	for _, event := range f.events {
-		if strings.HasPrefix(event, "hook:") {
-			t.Fatalf("sandbox hook escaped to host: %q", f.events)
+		if strings.HasPrefix(event, "sandbox:hook:") {
+			t.Fatalf("hook escaped into sandbox: %q", f.events)
 		}
 	}
 }
@@ -572,8 +850,8 @@ func TestHostMergeKeepAndRetryCleanup(t *testing.T) {
 	if refs := hostGit(t, f.root, "for-each-ref", "--format=%(refname)", "refs/heads/topic"); refs != "" {
 		t.Fatalf("merged branch retained: %s", refs)
 	}
-	if count := len(slices.DeleteFunc(slices.Clone(f.events), func(event string) bool { return event != "hook:mergecheck" })); count != 1 {
-		t.Fatalf("merge retry reran pre_merge: %q", f.events)
+	if count := len(slices.DeleteFunc(slices.Clone(f.events), func(event string) bool { return event != "hook:mergecheck" })); count != 2 {
+		t.Fatalf("ordinary kept merge must rerun pre_merge, cleanup retry must not: %q", f.events)
 	}
 	f.app.Getwd = func() (string, error) { return f.root, nil }
 	if err := f.run(t, "remove", "topic"); err != nil {
@@ -592,8 +870,11 @@ func TestHostRemoveDirtyUnmergedAndKeepBranch(t *testing.T) {
 		t.Fatal("keep-branch permitted dirty removal")
 	}
 	hostGit(t, w.Path, "commit", "-am", "unmerged")
-	if err := f.run(t, "remove", "topic"); err == nil {
-		t.Fatal("removed unmerged branch without force")
+	if err := f.run(t, "remove", "topic"); err != nil {
+		t.Fatal(err)
+	}
+	if state := f.load(t, "topic"); state.Stage != "ready" || state.Removal != nil || !strings.Contains(f.stdout.String(), "Aborted") {
+		t.Fatal("unmerged branch was not preserved without consent")
 	}
 	if err := f.run(t, "remove", "topic", "--force", "--keep-branch"); err != nil {
 		t.Fatal(err)
@@ -634,15 +915,8 @@ func TestHostIgnoredFilesPolicy(t *testing.T) {
 				t.Fatal("ignored files blocked merge", err)
 			}
 			err := f.run(t, "remove", "topic")
-			if test.changed || test.unknown {
-				if err == nil || !strings.Contains(err.Error(), "ignored file") {
-					t.Fatalf("expected ignored-file preservation, got %v", err)
-				}
-				if err := f.run(t, "remove", "topic", "--force"); err != nil {
-					t.Fatal(err)
-				}
-			} else if err != nil {
-				t.Fatal("unchanged provisioned ignored file blocked cleanup", err)
+			if err != nil {
+				t.Fatal("ignored file blocked cleanup", err)
 			}
 		})
 	}
@@ -694,7 +968,7 @@ func TestHostMergeConflictAndRefChangesPreserveResources(t *testing.T) {
 }
 
 func TestHostCleanupRetryAfterContainerFailure(t *testing.T) {
-	f := newHostFixture(t, "sandbox: {enabled: true}\npre_remove: [check]\n")
+	f := newHostFixture(t, "sandbox: {enabled: true}\npanes: [{command: opencode}]\npre_remove: [check]\n")
 	if err := f.run(t, "add", "topic", "-b"); err != nil {
 		t.Fatal(err)
 	}
@@ -713,7 +987,7 @@ func TestHostCleanupRetryAfterContainerFailure(t *testing.T) {
 	if state := f.load(t, "topic"); state.Stage != "removed" {
 		t.Fatal("retry did not finalize cleanup")
 	}
-	if count := len(slices.DeleteFunc(slices.Clone(f.events), func(event string) bool { return event != "sandbox:hook:check" })); count != 1 {
+	if count := len(slices.DeleteFunc(slices.Clone(f.events), func(event string) bool { return event != "hook:check" })); count != 1 {
 		t.Fatalf("cleanup retry reran completed hook: %q", f.events)
 	}
 }
@@ -726,16 +1000,21 @@ func TestHostConditionalBranchDeletePreservesChangedRef(t *testing.T) {
 	initial := hostGit(t, f.root, "rev-parse", "main")
 	hostGit(t, f.root, "commit", "--allow-empty", "-m", "later")
 	later := hostGit(t, f.root, "rev-parse", "main")
-	f.runner.git = func(p Process) error {
+	f.app.Runner = cleanupRunFunc(func(ctx context.Context, p Process) ([]byte, error) {
 		args := hostGitArgs(p)
 		if len(args) > 0 && args[0] == "update-ref" {
-			if args[len(args)-1] != initial {
-				t.Fatalf("missing expected old commit: %q", args)
+			input, err := io.ReadAll(p.Stdin)
+			if err != nil {
+				t.Fatal(err)
 			}
+			if !bytes.Contains(input, []byte("delete refs/heads/topic\x00"+initial+"\x00")) || !slices.Contains(args, "--no-deref") {
+				t.Fatalf("missing expected old commit or non-dereferencing deletion: %q, %q", args, input)
+			}
+			p.Stdin = bytes.NewReader(input)
 			hostGit(t, f.root, "update-ref", "refs/heads/topic", later, initial)
 		}
-		return nil
-	}
+		return f.runner.Run(ctx, p)
+	})
 	if err := f.run(t, "remove", "topic"); err == nil {
 		t.Fatal("deleted a concurrently changed ref")
 	}
@@ -745,7 +1024,7 @@ func TestHostConditionalBranchDeletePreservesChangedRef(t *testing.T) {
 	if f.mux.window != "" {
 		t.Fatal("worktree was removed before its window closed")
 	}
-	f.runner.git = nil
+	f.app.Runner = f.runner
 	if err := f.run(t, "remove", "topic", "--keep-branch"); err != nil {
 		t.Fatal("could not recover by preserving changed branch", err)
 	}
@@ -818,7 +1097,7 @@ func TestHostMergeDoesNotAutostashConcurrentDirt(t *testing.T) {
 }
 
 func TestHostStopFailureNeverRemovesWorktreeOrWindow(t *testing.T) {
-	f := newHostFixture(t, "sandbox: {enabled: true}\n")
+	f := newHostFixture(t, "sandbox: {enabled: true}\npanes: [{command: opencode}]\n")
 	if err := f.run(t, "add", "topic", "-b"); err != nil {
 		t.Fatal(err)
 	}
@@ -876,7 +1155,6 @@ func TestHostKeepBranchStillProtectsWorktreeData(t *testing.T) {
 	}{
 		{"dirty", func(t *testing.T, w workspaceState) { hostWrite(t, filepath.Join(w.Path, "tracked"), "dirty\n") }},
 		{"untracked", func(t *testing.T, w workspaceState) { hostWrite(t, filepath.Join(w.Path, "untracked"), "keep\n") }},
-		{"ignored", func(t *testing.T, w workspaceState) { hostWrite(t, filepath.Join(w.Path, ".env"), "keep\n") }},
 		{"unfinished", func(t *testing.T, w workspaceState) {
 			path := hostGit(t, w.Path, "rev-parse", "--path-format=absolute", "--git-path", "CHERRY_PICK_HEAD")
 			hostWrite(t, path, hostGit(t, w.Path, "rev-parse", "HEAD")+"\n")
@@ -1050,10 +1328,11 @@ func TestHostShutdownIsRecheckedAfterHooksAndCanBeClosed(t *testing.T) {
 	if state.Removal == nil || !state.Removal.HookDone || state.Removal.Stopped || state.Removal.WorktreeRemovalStarted {
 		t.Fatalf("incorrect interrupted shutdown record: %+v", state.Removal)
 	}
+	// Explicit close also requires a verified capture before it can release the lock.
+	f.mux.quiesceErr = nil
 	if err := f.run(t, "close", "topic"); err != nil {
 		t.Fatal("pending host cleanup must permit explicit close", err)
 	}
-	f.mux.quiesceErr = nil
 	if err := f.run(t, "remove", "topic"); err != nil {
 		t.Fatal(err)
 	}
@@ -1113,8 +1392,11 @@ func TestHostMissingWorktreeBeforeRemovalCheckpointIsNotSuccess(t *testing.T) {
 	w := f.load(t, "topic")
 	hostGit(t, f.root, "worktree", "remove", "--", w.Path)
 	f.runner.hook = nil
-	if err := f.run(t, "remove", "topic"); err == nil || !strings.Contains(err.Error(), "before the recorded Git removal step") {
-		t.Fatalf("external deletion was treated as successful cleanup: %v", err)
+	if err := f.run(t, "remove", "topic"); err != nil {
+		t.Fatal("external deletion could not enter explicit orphan recovery", err)
+	}
+	if state := f.load(t, "topic"); state.Removal.Recovery == nil || state.Removal.BranchDeleted || state.MergedCommit != "" {
+		t.Fatalf("external deletion was treated as normal completed cleanup: %+v", state)
 	}
 	if got := hostGit(t, f.root, "rev-parse", "topic"); got != w.Removal.Head {
 		t.Fatal("branch was removed without a recorded Git removal attempt")

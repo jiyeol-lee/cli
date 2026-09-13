@@ -177,7 +177,7 @@ func TestWorkmuxParsingDoesNotConstructDependencies(t *testing.T) {
 		{args: []string{"workmux", "add"}, wantErr: true},
 		{args: []string{"workmux", "list"}, wantErr: true},
 		{args: []string{"workmux", "merge", "--force"}, wantErr: true},
-		{args: []string{"workmux", "remove", "one", "two"}, wantErr: true},
+		{args: []string{"workmux", "merge", "one", "two"}, wantErr: true},
 		{args: []string{"workmux", "_cleanup"}, wantErr: true},
 		{args: []string{"workmux", "_cleanup", "--help"}, wantErr: true},
 	} {

@@ -18,15 +18,26 @@ type workspaceState struct {
 	OwnedIgnored       map[string]string `json:"owned_ignored,omitempty"`
 	PendingMergeCommit string            `json:"pending_merge_commit,omitempty"`
 	PendingMergeTarget string            `json:"pending_merge_target,omitempty"`
+	PendingMergeHead   string            `json:"pending_merge_head,omitempty"`
+	PendingMergePath   string            `json:"pending_merge_path,omitempty"`
+	RetryMergeTarget   string            `json:"retry_merge_target,omitempty"`
 	MergeKept          bool              `json:"merge_kept,omitempty"`
+	MergeStrategy      string            `json:"merge_strategy,omitempty"`
+	MergeResult        string            `json:"merge_result,omitempty"`
+	PendingSquashTree  string            `json:"pending_squash_tree,omitempty"`
+	PendingConflict    bool              `json:"pending_conflict,omitempty"`
 	Removal            *removalState     `json:"removal,omitempty"`
 }
 
 type removalState struct {
 	Head                   string           `json:"head,omitempty"`
 	Target                 string           `json:"target,omitempty"`
+	TargetOID              string           `json:"target_oid,omitempty"`
+	TargetRefOID           string           `json:"target_ref_oid,omitempty"`
+	DiscardCommits         bool             `json:"discard_commits,omitempty"`
 	KeepBranch             bool             `json:"keep_branch,omitempty"`
 	Force                  bool             `json:"force,omitempty"`
+	MergeResult            string           `json:"merge_result,omitempty"`
 	HookDone               bool             `json:"hook_done,omitempty"`
 	Stopped                bool             `json:"stopped,omitempty"`
 	WorktreeRemovalStarted bool             `json:"worktree_removal_started,omitempty"`
@@ -35,6 +46,7 @@ type removalState struct {
 	ContainerRemoved       bool             `json:"container_removed,omitempty"`
 	Identity               *cleanupIdentity `json:"identity,omitempty"`
 	Job                    *cleanupJob      `json:"job,omitempty"`
+	Recovery               *recoveryState   `json:"recovery,omitempty"`
 }
 
 type stateStore struct {
@@ -46,9 +58,12 @@ type stateStore struct {
 // Legacy container settings are accepted only in saved JSON, never in YAML config.
 func (config *SandboxConfig) UnmarshalJSON(data []byte) error {
 	var saved struct {
-		Enabled   bool   `json:"enabled"`
-		Image     string `json:"image"`
-		Container *struct {
+		LegacySELinuxType *string `json:"selinux_type"`
+		OpenCodeConfigDir string  `json:"opencode_config_dir"`
+		Enabled           bool    `json:"enabled"`
+		Image             string  `json:"image"`
+		Target            string  `json:"target"`
+		Container         *struct {
 			Runtime string `json:"runtime"`
 		} `json:"container"`
 	}
@@ -60,7 +75,7 @@ func (config *SandboxConfig) UnmarshalJSON(data []byte) error {
 	if saved.Enabled && saved.Container != nil && saved.Container.Runtime != "" && saved.Container.Runtime != "podman" {
 		return fmt.Errorf("unsupported previous sandbox backend %q in workspace state: only Podman workspaces can be used; recover this workspace with the previous implementation", saved.Container.Runtime)
 	}
-	*config = SandboxConfig{Enabled: saved.Enabled, Image: saved.Image}
+	*config = SandboxConfig{OpenCodeConfigDir: saved.OpenCodeConfigDir, Enabled: saved.Enabled, Image: saved.Image, Target: saved.Target}
 	return nil
 }
 
@@ -171,10 +186,10 @@ func (store *stateStore) validate(state workspaceState) error {
 	if err := safeName(w.Branch); err != nil {
 		return err
 	}
-	if w.Handle != strings.ReplaceAll(w.Branch, "/", "-") || !safeRelative(w.Handle) || strings.ContainsAny(w.Handle, "/\\") {
+	if !safeRelative(w.Handle) || strings.ContainsAny(w.Handle, "/\\") {
 		return fmt.Errorf("invalid workspace handle in state")
 	}
-	if w.Path != workspacePath(w.Root, w.Handle) || w.Path == w.Root || w.ID != identity(w.CommonDir, w.Path) {
+	if !filepath.IsAbs(w.Path) || filepath.Clean(w.Path) != w.Path || strings.ContainsAny(w.Path, "\x00\r\n") || w.Path == w.Root || w.Path == w.CommonDir || w.ID != identity(w.CommonDir, w.Path) {
 		return fmt.Errorf("workspace path or identity does not match its owned location")
 	}
 	parent := filepath.Dir(w.Path)
@@ -211,17 +226,31 @@ func (store *stateStore) validate(state workspaceState) error {
 	default:
 		return fmt.Errorf("unknown workspace recovery stage %q", w.Stage)
 	}
-	for _, oid := range []string{state.InitialCommit, state.PendingMergeCommit, w.MergedCommit} {
+	for _, oid := range []string{state.InitialCommit, state.PendingMergeCommit, state.PendingMergeHead, w.MergedCommit, state.MergeResult, state.PendingSquashTree} {
 		if oid != "" && !validOID(oid) {
 			return fmt.Errorf("invalid saved commit ID")
 		}
 	}
-	for _, branch := range []string{state.PendingMergeTarget, w.MergeTarget} {
+	switch state.MergeStrategy {
+	case "", "merge", "rebase", "squash":
+	default:
+		return fmt.Errorf("invalid recorded merge strategy")
+	}
+	if state.PendingSquashTree != "" && (state.MergeStrategy != "squash" || state.PendingMergeCommit == "" || state.PendingMergeHead == "") {
+		return fmt.Errorf("squash checkpoint lacks its source or target")
+	}
+	if state.PendingConflict && state.PendingMergeCommit == "" {
+		return fmt.Errorf("conflict checkpoint lacks its pending merge")
+	}
+	for _, branch := range []string{w.BaseRef, state.PendingMergeTarget, state.RetryMergeTarget, w.MergeTarget} {
 		if branch != "" {
-			if err := safeName(branch); err != nil {
+			if err := safeComparisonRef(branch, w.Branch); err != nil {
 				return err
 			}
 		}
+	}
+	if state.PendingMergePath != "" && (!filepath.IsAbs(state.PendingMergePath) || filepath.Clean(state.PendingMergePath) != state.PendingMergePath || strings.ContainsAny(state.PendingMergePath, "\x00\r\n") || state.PendingMergePath == w.Path) {
+		return fmt.Errorf("invalid pending merge path")
 	}
 	for path := range state.OwnedIgnored {
 		if !safeRelative(path) {
@@ -229,13 +258,24 @@ func (store *stateStore) validate(state workspaceState) error {
 		}
 	}
 	if state.Removal != nil {
-		if state.Removal.Head != "" && !validOID(state.Removal.Head) {
-			return fmt.Errorf("invalid removal commit ID")
+		for _, oid := range []string{state.Removal.Head, state.Removal.TargetOID, state.Removal.TargetRefOID, state.Removal.MergeResult} {
+			if oid != "" && !validOID(oid) {
+				return fmt.Errorf("invalid removal commit ID")
+			}
 		}
 		if state.Removal.Target != "" {
-			if err := safeName(state.Removal.Target); err != nil {
+			if err := safeComparisonRef(state.Removal.Target, w.Branch); err != nil {
 				return err
 			}
+		}
+		if state.Removal.TargetRefOID != "" && (!strings.HasPrefix(state.Removal.Target, "refs/") || !validOID(state.Removal.TargetOID)) {
+			return fmt.Errorf("comparison ref object ID lacks full ref or commit")
+		}
+		if state.Removal.MergeResult != "" && (!validOID(state.Removal.Head) || !validOID(state.Removal.TargetOID) || !strings.HasPrefix(state.Removal.Target, "refs/heads/")) {
+			return fmt.Errorf("merge cleanup lacks its pinned source and target")
+		}
+		if state.Removal.DiscardCommits && (!validOID(state.Removal.Head) || !validOID(state.Removal.TargetOID) || state.Removal.Target == "") {
+			return fmt.Errorf("commit discard consent lacks source or comparison commit")
 		}
 		if state.Removal.WorktreeRemovalStarted && (!state.Removal.HookDone || !state.Removal.Stopped || !validOID(state.Removal.Head)) {
 			return fmt.Errorf("worktree removal checkpoint lacks completed hooks, shutdown, or source commit")
@@ -247,14 +287,8 @@ func (store *stateStore) validate(state workspaceState) error {
 	if state.MergeKept && (state.MergedCommit == "" || state.PendingMergeCommit != "" || state.Removal != nil) {
 		return fmt.Errorf("retained merge record conflicts with pending work")
 	}
-	if w.Stage != "removed" {
-		if err := w.Config.Validate(); err != nil {
-			return fmt.Errorf("invalid saved workspace configuration: %w", err)
-		}
-		if _, err := w.Config.SelectPanes(w.Layout); err != nil {
-			return err
-		}
-	}
+	// Pane snapshots are legacy recovery data, not the current configuration.
+	// New YAML is validated by the loader; cleanup never launches saved panes.
 	return nil
 }
 
@@ -286,9 +320,45 @@ func (store *stateStore) load() ([]workspaceState, error) {
 		if err := store.validate(state); err != nil {
 			return nil, err
 		}
+		if err := rememberSandbox(filepath.Dir(store.dir), &state); err != nil {
+			return nil, err
+		}
 		states = append(states, state)
 	}
 	return states, nil
+}
+
+func rememberSandbox(base string, state *workspaceState) error {
+	if state.SandboxUsed || state.Stage == "removed" {
+		return nil
+	}
+	// Mount snapshots also identify launches from versions that did not record
+	// explicit shells in workspace JSON. Never probe Podman for host-only work.
+	path := filepath.Join(base, "containers", sandboxWorkspaceKey(state.Workspace))
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := sandboxDirectory(path, false, true); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		// Standalone snapshots have separate lifecycle records and leave these
+		// parent directories behind after their session finishes.
+		if entry.Name() == "runs" && entry.IsDir() {
+			continue
+		}
+		// Preserve conservative recovery for legacy snapshots, endpoint records,
+		// and unexpected entries rather than treating them as host-only history.
+		state.SandboxUsed = true
+		break
+	}
+	return nil
 }
 
 func readState(path string) (workspaceState, error) {

@@ -10,18 +10,18 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"unicode"
 )
 
 type provisionEntry struct {
 	name    string
 	info    fs.FileInfo
 	symlink bool
+	follow  bool
+	link    *string
 }
 
 type provisionMatch struct {
 	name    string
-	pattern string
 	symlink bool
 }
 
@@ -35,9 +35,6 @@ func ApplyFiles(ctx context.Context, root, destination string, files FilesConfig
 	if len(files.Copy) == 0 && len(files.Symlink) == 0 {
 		return nil
 	}
-	if stderr == nil {
-		stderr = io.Discard
-	}
 	source, sourcePath, err := openProvisionRoot(root, false)
 	if err != nil {
 		return fmt.Errorf("open source root: %w", err)
@@ -48,6 +45,9 @@ func ApplyFiles(ctx context.Context, root, destination string, files FilesConfig
 		return fmt.Errorf("open destination root: %w", err)
 	}
 	defer func() { _ = target.Close() }()
+	if sourcePath == targetPath {
+		return fmt.Errorf("source and destination roots must differ")
+	}
 	var matches []provisionMatch
 	for _, list := range []struct {
 		name     string
@@ -58,38 +58,49 @@ func ApplyFiles(ctx context.Context, root, destination string, files FilesConfig
 		{"symlink", files.Symlink, true},
 	} {
 		for _, pattern := range list.patterns {
-			names, err := globProvision(ctx, source, pattern)
+			relative := pattern
+			if filepath.IsAbs(pattern) {
+				relative, err = filepath.Rel(sourcePath, pattern)
+				if err != nil || !filepath.IsLocal(relative) {
+					return fmt.Errorf("files.%s pattern %q is outside the repository", list.name, pattern)
+				}
+			}
+			names, err := globProvision(ctx, source, relative)
 			if err != nil {
 				return fmt.Errorf("files.%s pattern %q: %w", list.name, pattern, err)
 			}
-			if len(names) == 0 {
-				if _, err := fmt.Fprintf(stderr, "workmux: warning: files.%s pattern %q matched no files\n", list.name, pattern); err != nil {
-					return fmt.Errorf("write file warning: %w", err)
-				}
-			}
 			for _, name := range names {
-				matches = append(matches, provisionMatch{name: name, pattern: pattern, symlink: list.symlink})
+				matches = append(matches, provisionMatch{name: name, symlink: list.symlink})
 			}
 		}
-	}
-	slices.SortFunc(matches, func(a, b provisionMatch) int { return strings.Compare(a.name, b.name) })
-	selected := make(map[string]provisionMatch)
-	for _, match := range matches {
-		for name := match.name; name != "."; name = filepath.Dir(name) {
-			if previous, ok := selected[name]; ok {
-				return fmt.Errorf("overlapping file patterns %q and %q at %q and %q", previous.pattern, match.pattern, previous.name, match.name)
-			}
-		}
-		selected[match.name] = match
 	}
 	var plan []provisionEntry
 	for _, match := range matches {
-		entries, err := scanProvisionSource(ctx, source, match.name)
+		var entries []provisionEntry
+		if match.symlink {
+			if match.name == "." {
+				return fmt.Errorf("files.symlink cannot replace the destination root")
+			}
+			var info fs.FileInfo
+			info, err = provisionSourceInfo(ctx, source, match.name)
+			if err == nil {
+				entries = []provisionEntry{{name: match.name, info: info, symlink: true}}
+			}
+		} else {
+			entries, err = scanProvisionSource(ctx, source, match.name)
+		}
 		if err != nil {
 			return fmt.Errorf("preflight source %q: %w", match.name, err)
 		}
+		if len(entries) == 0 {
+			continue
+		}
 		if entries[0].info.IsDir() {
-			rel, err := filepath.Rel(filepath.Join(sourcePath, match.name), targetPath)
+			canonical, err := filepath.EvalSymlinks(filepath.Join(sourcePath, match.name))
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(canonical, targetPath)
 			if err != nil {
 				return fmt.Errorf("check source directory %q: %w", match.name, err)
 			}
@@ -97,19 +108,14 @@ func ApplyFiles(ctx context.Context, root, destination string, files FilesConfig
 				return fmt.Errorf("source directory %q contains the destination", match.name)
 			}
 		}
-		if match.symlink {
-			entries = entries[:1]
-			entries[0].symlink = true
-		}
 		plan = append(plan, entries...)
 	}
 	for _, entry := range plan {
-		if err := preflightProvisionTarget(ctx, target, entry.name); err != nil {
-			return fmt.Errorf("preflight destination %q: %w", entry.name, err)
+		rel, err := filepath.Rel(filepath.Join(targetPath, entry.name), sourcePath)
+		if err != nil || filepath.IsLocal(rel) {
+			return fmt.Errorf("destination %q contains the source root", entry.name)
 		}
-	}
-	for _, entry := range plan {
-		if err := applyProvisionEntry(ctx, source, target, sourcePath, entry); err != nil {
+		if err := applyProvisionEntry(ctx, source, target, sourcePath, targetPath, entry); err != nil {
 			return fmt.Errorf("provision %q: %w", entry.name, err)
 		}
 	}
@@ -128,11 +134,11 @@ func validateFilePatterns(files FilesConfig) error {
 			if err := validateProvisionPath(pattern); err != nil {
 				return fmt.Errorf("files.%s pattern %q: %w", list.name, pattern, err)
 			}
-			if strings.Contains(pattern, "<global>") || strings.Contains(pattern, "<agent>") {
-				return fmt.Errorf("files.%s pattern %q: unresolved placeholder; only a separate <global> repository list entry is supported", list.name, pattern)
-			}
 			for part := range strings.SplitSeq(pattern, string(filepath.Separator)) {
-				if _, err := filepath.Match(part, ""); err != nil {
+				if strings.Contains(part, "**") && part != "**" {
+					return fmt.Errorf("files.%s pattern %q: ** must be a complete path component", list.name, pattern)
+				}
+				if _, err := filepath.Match(provisionGlobPart(part), ""); err != nil {
 					return fmt.Errorf("files.%s pattern %q: %w", list.name, pattern, err)
 				}
 			}
@@ -142,15 +148,12 @@ func validateFilePatterns(files FilesConfig) error {
 }
 
 func validateProvisionPath(name string) error {
-	if strings.TrimSpace(name) == "" || filepath.IsAbs(name) || strings.ContainsRune(name, '\\') || strings.ContainsFunc(name, unicode.IsControl) {
-		return fmt.Errorf("expected a relative path without backslashes or control characters")
+	if strings.ContainsRune(name, '\x00') {
+		return fmt.Errorf("paths must not contain NUL")
 	}
 	for part := range strings.SplitSeq(name, string(filepath.Separator)) {
-		if part == "" || part == "." || part == ".." {
-			return fmt.Errorf("empty, . and .. path components are not allowed")
-		}
-		if strings.EqualFold(part, ".git") {
-			return fmt.Errorf(".git paths are not allowed")
+		if part == ".." {
+			return fmt.Errorf(".. path components are not allowed")
 		}
 	}
 	return nil
@@ -237,29 +240,69 @@ func openProvisionDirectory(ctx context.Context, root *os.Root, name string, cre
 }
 
 func provisionSourceInfo(ctx context.Context, root *os.Root, name string) (fs.FileInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := validateProvisionPath(name); err != nil {
 		return nil, err
 	}
-	parent, err := openProvisionDirectory(ctx, root, filepath.Dir(name), false)
+	name, err := provisionSourceName(root, name, false)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = parent.Close() }()
-	info, err := parent.Lstat(filepath.Base(name))
+	return os.Lstat(name)
+}
+
+func provisionSourceName(root *os.Root, name string, follow bool) (string, error) {
+	// Authorize the lexical path; configured source symlinks may resolve outside it.
+	if err := validateProvisionPath(name); err != nil {
+		return "", err
+	}
+	if !filepath.IsLocal(name) {
+		return "", fmt.Errorf("source path %q is outside the repository", name)
+	}
+	if name == "." {
+		return root.Name(), nil
+	}
+	path := filepath.Join(root.Name(), name)
+	if !follow {
+		path = filepath.Dir(path)
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	if !follow {
+		canonical = filepath.Join(canonical, filepath.Base(name))
+	}
+	return canonical, nil
+}
+
+func provisionSourceStat(root *os.Root, name string) (fs.FileInfo, error) {
+	name, err := provisionSourceName(root, name, true)
 	if err != nil {
 		return nil, err
 	}
-	if info.Mode()&fs.ModeSymlink != 0 {
-		return nil, fmt.Errorf("refusing source symlink %q; select its real in-root target instead", name)
+	return os.Stat(name)
+}
+
+func provisionSourceLink(root *os.Root, name string) (string, error) {
+	name, err := provisionSourceName(root, name, false)
+	if err != nil {
+		return "", err
 	}
-	if !info.IsDir() && !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("source %q is not a regular file or directory", name)
-	}
-	return info, nil
+	return os.Readlink(name)
 }
 
 func readProvisionDirectory(ctx context.Context, root *os.Root, name string) ([]fs.DirEntry, error) {
-	directory, err := openProvisionDirectory(ctx, root, name, false)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	name, err := provisionSourceName(root, name, true)
+	if err != nil {
+		return nil, err
+	}
+	directory, err := os.OpenRoot(name)
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +321,11 @@ func readProvisionDirectory(ctx context.Context, root *os.Root, name string) ([]
 }
 
 func globProvision(ctx context.Context, root *os.Root, pattern string) ([]string, error) {
+	if filepath.Clean(pattern) == "." {
+		return []string{"."}, ctx.Err()
+	}
 	found := make(map[string]bool)
+	var ancestors []fs.FileInfo
 	var visit func(string, []string) error
 	visit = func(directory string, parts []string) error {
 		if err := ctx.Err(); err != nil {
@@ -290,10 +337,25 @@ func globProvision(ctx context.Context, root *os.Root, pattern string) ([]string
 			}
 			return nil
 		}
+		info, err := provisionSourceStat(root, directory)
+		if err != nil {
+			return err
+		}
+		for _, ancestor := range ancestors {
+			if os.SameFile(info, ancestor) {
+				return nil
+			}
+		}
+		ancestors = append(ancestors, info)
+		defer func() { ancestors = ancestors[:len(ancestors)-1] }()
 		if parts[0] == "**" {
+			// Matching zero directories is not a recursive descent.
+			ancestors = ancestors[:len(ancestors)-1]
 			if err := visit(directory, parts[1:]); err != nil {
+				ancestors = append(ancestors, info)
 				return err
 			}
+			ancestors = append(ancestors, info)
 		}
 		entries, err := readProvisionDirectory(ctx, root, directory)
 		if err != nil {
@@ -308,11 +370,10 @@ func globProvision(ctx context.Context, root *os.Root, pattern string) ([]string
 				if len(parts) == 1 {
 					found[name] = true
 				}
-				// Recursive searches do not enter Git metadata, even when it is a file.
-				if strings.EqualFold(entry.Name(), ".git") {
+				info, err := provisionSourceStat(root, name)
+				if errors.Is(err, fs.ErrNotExist) {
 					continue
 				}
-				info, err := provisionSourceInfo(ctx, root, name)
 				if err != nil {
 					return err
 				}
@@ -323,7 +384,7 @@ func globProvision(ctx context.Context, root *os.Root, pattern string) ([]string
 				}
 				continue
 			}
-			matched, err := filepath.Match(parts[0], entry.Name())
+			matched, err := filepath.Match(provisionGlobPart(parts[0]), entry.Name())
 			if err != nil {
 				return err
 			}
@@ -334,7 +395,10 @@ func globProvision(ctx context.Context, root *os.Root, pattern string) ([]string
 				found[name] = true
 				continue
 			}
-			info, err := provisionSourceInfo(ctx, root, name)
+			info, err := provisionSourceStat(root, name)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
 			if err != nil {
 				return err
 			}
@@ -346,32 +410,60 @@ func globProvision(ctx context.Context, root *os.Root, pattern string) ([]string
 		}
 		return nil
 	}
-	if err := visit(".", strings.Split(pattern, string(filepath.Separator))); err != nil {
+	if err := visit(".", strings.Split(filepath.Clean(pattern), string(filepath.Separator))); err != nil {
 		return nil, err
 	}
 	names := make([]string, 0, len(found))
 	for name := range found {
-		covered := false
-		for parent := filepath.Dir(name); parent != "."; parent = filepath.Dir(parent) {
-			if found[parent] {
-				covered = true
-				break
+		if strings.HasSuffix(pattern, string(filepath.Separator)) {
+			info, err := provisionSourceStat(root, name)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if !info.IsDir() {
+				continue
 			}
 		}
-		if !covered {
-			names = append(names, name)
-		}
+		names = append(names, name)
 	}
 	slices.Sort(names)
 	return names, nil
 }
 
+func provisionGlobPart(part string) string {
+	// Rust glob uses ! for a negated class and treats backslashes literally.
+	return strings.ReplaceAll(strings.ReplaceAll(part, `\`, `\\`), "[!", "[^")
+}
+
 func scanProvisionSource(ctx context.Context, root *os.Root, name string) ([]provisionEntry, error) {
+	return scanProvisionTree(ctx, root, name, true, nil)
+}
+
+func scanProvisionTree(ctx context.Context, root *os.Root, name string, top bool, ancestors []fs.FileInfo) ([]provisionEntry, error) {
 	info, err := provisionSourceInfo(ctx, root, name)
 	if err != nil {
 		return nil, err
 	}
-	plan := []provisionEntry{{name: name, info: info}}
+	entry := provisionEntry{name: name, info: info}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		if !top {
+			link, err := provisionSourceLink(root, name)
+			entry.link = &link
+			return []provisionEntry{entry}, err
+		}
+		info, err = provisionSourceStat(root, name)
+		if err != nil {
+			return nil, err
+		}
+		entry.info, entry.follow = info, true
+	}
+	if !info.IsDir() && !info.Mode().IsRegular() {
+		return nil, nil
+	}
+	plan := []provisionEntry{entry}
 	if !info.IsDir() {
 		file, err := openProvisionFile(ctx, root, name, info)
 		if err != nil {
@@ -379,12 +471,18 @@ func scanProvisionSource(ctx context.Context, root *os.Root, name string) ([]pro
 		}
 		return plan, file.Close()
 	}
+	for _, ancestor := range ancestors {
+		if os.SameFile(info, ancestor) {
+			return nil, fmt.Errorf("source directory cycle at %q", name)
+		}
+	}
+	ancestors = append(ancestors, info)
 	entries, err := readProvisionDirectory(ctx, root, name)
 	if err != nil {
 		return nil, err
 	}
 	for _, entry := range entries {
-		children, err := scanProvisionSource(ctx, root, filepath.Join(name, entry.Name()))
+		children, err := scanProvisionTree(ctx, root, filepath.Join(name, entry.Name()), false, ancestors)
 		if err != nil {
 			return nil, err
 		}
@@ -394,19 +492,21 @@ func scanProvisionSource(ctx context.Context, root *os.Root, name string) ([]pro
 }
 
 func openProvisionFile(ctx context.Context, root *os.Root, name string, info fs.FileInfo) (*os.File, error) {
-	parent, err := openProvisionDirectory(ctx, root, filepath.Dir(name), false)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	name, err := provisionSourceName(root, name, true)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = parent.Close() }()
-	current, err := parent.Lstat(filepath.Base(name))
+	current, err := os.Stat(name)
 	if err != nil {
 		return nil, err
 	}
 	if !current.Mode().IsRegular() || !os.SameFile(info, current) {
 		return nil, fmt.Errorf("source file %q changed during provisioning", name)
 	}
-	file, err := parent.Open(filepath.Base(name))
+	file, err := os.Open(name)
 	if err != nil {
 		return nil, err
 	}
@@ -418,44 +518,37 @@ func openProvisionFile(ctx context.Context, root *os.Root, name string, info fs.
 	return file, nil
 }
 
-func preflightProvisionTarget(ctx context.Context, root *os.Root, name string) error {
-	parent, err := openProvisionDirectory(ctx, root, filepath.Dir(name), false)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	defer func() { _ = parent.Close() }()
-	if _, err := parent.Lstat(filepath.Base(name)); !errors.Is(err, fs.ErrNotExist) {
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf("destination already exists; files are never overwritten")
-	}
-	return nil
-}
-
-func applyProvisionEntry(ctx context.Context, source, destination *os.Root, sourcePath string, entry provisionEntry) error {
+func applyProvisionEntry(ctx context.Context, source, destination *os.Root, sourcePath, destinationPath string, entry provisionEntry) error {
 	info, err := provisionSourceInfo(ctx, source, entry.name)
+	if err == nil && entry.follow {
+		info, err = provisionSourceStat(source, entry.name)
+	}
 	if err != nil {
 		return err
 	}
 	if !os.SameFile(entry.info, info) {
 		return fmt.Errorf("source changed during provisioning")
 	}
-	if entry.symlink {
-		if _, err := scanProvisionSource(ctx, source, entry.name); err != nil {
-			return err
-		}
-	}
 	var input *os.File
-	if !entry.symlink && !info.IsDir() {
+	if !entry.symlink && entry.link == nil && !info.IsDir() {
 		input, err = openProvisionFile(ctx, source, entry.name, entry.info)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = input.Close() }()
+	}
+	var link string
+	if entry.link != nil {
+		link, err = provisionSourceLink(source, entry.name)
+		if err != nil || link != *entry.link {
+			return fmt.Errorf("source symlink changed during provisioning")
+		}
+	}
+	if entry.symlink {
+		link, err = filepath.Rel(filepath.Dir(filepath.Join(destinationPath, entry.name)), filepath.Join(sourcePath, entry.name))
+		if err != nil {
+			return err
+		}
 	}
 	parent, err := openProvisionDirectory(ctx, destination, filepath.Dir(entry.name), true)
 	if err != nil {
@@ -466,23 +559,33 @@ func applyProvisionEntry(ctx context.Context, source, destination *os.Root, sour
 		return err
 	}
 	name := filepath.Base(entry.name)
-	if entry.symlink {
-		return parent.Symlink(filepath.Join(sourcePath, entry.name), name)
+	current, err := parent.Lstat(name)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
-	if info.IsDir() {
+	directory := info.IsDir() && !entry.symlink && entry.link == nil
+	if err == nil {
+		if directory && current.IsDir() {
+			return nil
+		}
+		if err := parent.RemoveAll(name); err != nil {
+			return err
+		}
+	}
+	if entry.symlink || entry.link != nil {
+		return parent.Symlink(link, name)
+	}
+	if directory {
 		return parent.Mkdir(name, 0700)
 	}
-	mode := fs.FileMode(0600)
-	if entry.info.Mode().Perm()&0111 != 0 {
-		mode = 0700
-	}
-	output, err := parent.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	output, err := parent.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
 	_, copyErr := io.Copy(output, provisionReader{ctx: ctx, reader: input})
+	modeErr := output.Chmod(info.Mode() & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky))
 	closeErr := output.Close()
-	return errors.Join(copyErr, closeErr, ctx.Err())
+	return errors.Join(copyErr, modeErr, closeErr, ctx.Err())
 }
 
 type provisionReader struct {
