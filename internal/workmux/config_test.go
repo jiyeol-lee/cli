@@ -144,8 +144,8 @@ func TestLoadConfigListSplicing(t *testing.T) {
 	for _, field := range []string{"post_create", "pre_merge", "pre_remove", "files.copy", "files.symlink"} {
 		t.Run(field, func(t *testing.T) {
 			makeList := func(values string) string {
-				if strings.HasPrefix(field, "files.") {
-					return "files: {" + strings.TrimPrefix(field, "files.") + ": " + values + "}"
+				if name, ok := strings.CutPrefix(field, "files."); ok {
+					return "files: {" + name + ": " + values + "}"
 				}
 				return field + ": " + values
 			}
@@ -323,7 +323,11 @@ func TestLoadConfigUnreadable(t *testing.T) {
 		if err := os.Chmod(path, 0000); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { os.Chmod(path, 0600) })
+		t.Cleanup(func() {
+			if err := os.Chmod(path, 0600); err != nil {
+				t.Error(err)
+			}
+		})
 		if _, err := LoadConfig(dir, "project"); err == nil || !strings.Contains(err.Error(), path) {
 			t.Fatalf("permission error = %v", err)
 		}
@@ -439,8 +443,7 @@ func TestConfigValidate(t *testing.T) {
 func TestConfigSerializationTags(t *testing.T) {
 	for _, value := range []any{Config{}, Pane{}, FilesConfig{}, Layout{}, SandboxConfig{}} {
 		typeOf := reflect.TypeOf(value)
-		for i := 0; i < typeOf.NumField(); i++ {
-			field := typeOf.Field(i)
+		for field := range typeOf.Fields() {
 			yamlTag, jsonTag := field.Tag.Get("yaml"), field.Tag.Get("json")
 			if yamlTag == "" || yamlTag != jsonTag || strings.ToLower(yamlTag) != yamlTag || strings.Contains(yamlTag, ",") {
 				t.Errorf("%s.%s tags = %q, %q", typeOf.Name(), field.Name, yamlTag, jsonTag)

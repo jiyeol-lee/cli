@@ -47,7 +47,11 @@ func TestExecRunnerCancellationWithInheritedPipes(t *testing.T) {
 				t.Fatal("hook did not start its child")
 			}
 			// The non-group case intentionally leaves a child holding the output pipes.
-			t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+			t.Cleanup(func() {
+				if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+					t.Error(err)
+				}
+			})
 			cancel()
 			select {
 			case err := <-done:

@@ -26,7 +26,11 @@ func TestMigrateIsIdempotentAndUsesIndependentLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	t.Cleanup(func() {
+		if err := rows.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	var records []string
 	for rows.Next() {
 		var app, name string
@@ -35,6 +39,9 @@ func TestMigrateIsIdempotentAndUsesIndependentLedger(t *testing.T) {
 			t.Fatal(err)
 		}
 		records = append(records, app+":"+name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	if len(records) != 2 || records[0] != "memory:0001_create_memories.sql" || records[1] != "other:0001_create_other.sql" {
 		t.Fatalf("ledger = %#v", records)
@@ -72,6 +79,10 @@ func testDatabase(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	return db
 }

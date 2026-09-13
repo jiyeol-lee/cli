@@ -23,7 +23,11 @@ func hostStateStore(t *testing.T, f *hostFixture) *stateStore {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { store.unlock() })
+	t.Cleanup(func() {
+		if err := store.unlock(); err != nil {
+			t.Error(err)
+		}
+	})
 	return store
 }
 
@@ -34,7 +38,9 @@ func TestStatePrivateAtomicAndNonblockingLock(t *testing.T) {
 	}
 	store := hostStateStore(t, f)
 	if extra, err := lockState(f.state, store.repo); err == nil {
-		extra.unlock()
+		if err := extra.unlock(); err != nil {
+			t.Error(err)
+		}
 		t.Fatal("second nonblocking lock succeeded")
 	}
 	states, err := store.load()
@@ -79,7 +85,9 @@ func TestStatePrivateAtomicAndNonblockingLock(t *testing.T) {
 	if err != nil {
 		t.Fatal("lock was not released", err)
 	}
-	second.unlock()
+	if err := second.unlock(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestStateRejectsRestoredPathAndIdentityInjection(t *testing.T) {

@@ -59,7 +59,7 @@ func readVocabularyColumns(ctx context.Context, tx database.BaselineQueryer) ([]
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var columns []vocabularyColumn
 	for rows.Next() {
@@ -97,7 +97,7 @@ func hasUniqueWordIndex(ctx context.Context, tx database.BaselineQueryer) (bool,
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	indexes := make(map[string][]string)
 	for rows.Next() {

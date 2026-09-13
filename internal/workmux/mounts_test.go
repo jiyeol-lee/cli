@@ -458,7 +458,11 @@ func TestSandboxRefusesHostSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { listener.Close() })
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	if _, err := c.mountPlan(context.Background(), w, engine.image, true); err == nil || !strings.Contains(err.Error(), "sockets") {
 		t.Fatalf("socket mount rejection = %v", err)
 	}
@@ -620,7 +624,11 @@ func TestSandboxDataLinks(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				t.Cleanup(func() { listener.Close() })
+				t.Cleanup(func() {
+					if err := listener.Close(); err != nil {
+						t.Error(err)
+					}
+				})
 			}
 			if kind != "hardlink" && kind != "pipe" && kind != "socket" {
 				if err := os.Symlink(value, link); err != nil {

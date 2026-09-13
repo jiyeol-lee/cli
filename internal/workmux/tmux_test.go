@@ -174,7 +174,11 @@ func TestTmuxCapturedOwnershipAndSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { listener.Close() })
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	id, err := tmuxSocketIdentity(socket)
 	if err != nil {
 		t.Fatal(err)
@@ -302,7 +306,8 @@ func isolatedTmux(t *testing.T) (context.Context, isolatedTmuxRunner, Tmux, stri
 	t.Cleanup(func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		runner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
+		// Some tests close the last window or replace the socket before teardown.
+		_, _ = runner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
 	})
 	out, err := runner.Run(ctx, Process{Name: "tmux", Args: []string{"new-session", "-d", "-x", "120", "-y", "40", "-s", "workmux-test", "-P", "-F", "#{session_id}\t#{pane_id}", "--", "sleep", "60"}})
 	if err != nil {

@@ -39,11 +39,11 @@ func open(path string, wal bool) (*sql.DB, error) {
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxIdleTime(time.Minute)
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("secure database: %w", err)
 	}
 	return db, nil
