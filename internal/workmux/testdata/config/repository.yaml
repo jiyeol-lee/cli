@@ -1,0 +1,17 @@
+# Installed externally as <repo>.yaml, never read from a worktree.
+# Repo config -> repo-config.yaml; all repo- names gain another repo- prefix.
+# Repo lists replace global lists, except for an exact <global> splice entry.
+panes:
+  - command: project-editor
+files:
+  copy: [before.env, <global>, after.env]
+  symlink: []
+layouts:
+  review:
+    panes:
+      - command: project-review
+post_create: [before, <global>, after]
+pre_merge: []
+pre_remove: [project-clean]
+sandbox:
+  enabled: false

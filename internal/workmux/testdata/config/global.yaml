@@ -1,0 +1,26 @@
+# Installed externally as config.yaml. Omitted keys inherit, null is rejected.
+# Use panes: [] for one shell, and [] to disable hooks or file lists.
+panes:
+  - command: editor
+    focus: true
+  - command: go test ./...
+    split: vertical
+    percentage: 30
+files:
+  copy: [.env, local/*.json]
+  symlink: [cache]
+layouts:
+  review:
+    panes:
+      - command: git diff
+        zoom: true
+      - split: horizontal
+        size: 20
+  shell:
+    panes: []
+post_create: [prepare, report]
+pre_merge: [check]
+pre_remove: [clean]
+sandbox:
+  enabled: true
+  image: registry.example.com/team/dev:stable
