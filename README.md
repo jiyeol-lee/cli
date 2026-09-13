@@ -99,52 +99,43 @@ Inside tmux it uses `tmux display-message` instead of `tput` to determine width.
 
 ## Workmux
 
-Workmux manages one linked Git worktree and one tmux window per workspace. It requires Linux, Bash, Git, and tmux 3.2 or newer. Without configuration, it opens one host shell. With `sandbox.enabled: true`, every pane and lifecycle hook runs in one persistent container, including panes with no command.
+Workmux manages linked Git worktrees and tmux windows. Run lifecycle commands in a host shell inside the repository or a linked worktree. The current implementation targets Linux with Bash, Git, and tmux 3.2+. `add` and `open` need a live tmux pane with valid `$TMUX` and `$TMUX_PANE`. Podman is needed only for sandboxed commands.
 
-Run all `cli workmux` commands in a host shell, from the repository or one of its worktrees. `add` and `open` require a live tmux pane with valid `$TMUX` and `$TMUX_PANE`. Keep a separate host window for lifecycle commands when using the sandbox. The image has no `cli` binary, and there is no host RPC service inside it.
+The completed rewrite follows selected behaviors from Workmux source `2be0294cb5fc06ddbfa9a0dbb138a95ef81b61b3`, built as `0.1.262`. It does not implement every upstream command. Handles support ASCII/English naming only, with plain `wm-` window prefixes and no emoji, Nerd Font decoration, or transliteration. See [reference, limits, and verification gaps](internal/workmux/upstream.md).
 
-### Sandbox setup
-
-The sandbox uses only Podman. Workmux forces local mode with `--remote=false`. Use it rootless as your normal login user, not through `sudo podman`. On Fedora, install the host tools and check the engine:
+### Start and reopen work
 
 ```sh
-sudo dnf install git tmux podman
-tmux -V
-podman --remote=false info
+tmux new-session -s dev
+cli workmux add feature/login --base main
+cli workmux close feature/login
+cli workmux open feature/login
 ```
 
-Fix rootless setup errors before proceeding, including missing subordinate UID/GID ranges in `/etc/subuid` and `/etc/subgid`. No container engine is needed when the sandbox is disabled.
+For a checkout named `myapp`, this creates sibling `myapp__worktrees/feature-login` and window `wm-feature-login`. The branch stays `feature/login`. `add` prints the path and focuses the window; `--background` avoids switching focus. `--name <handle>` overrides the directory/window handle.
 
-From this checkout's root, review and manually copy the image files into the external Workmux directory. Back up any customized copies first, since `cp` replaces them. Each line is a separate command:
+New branches start from the invoking checkout's branch and save it as their base. `--base <ref>` selects another starting ref; detached HEAD requires it. Existing local branches are reused unchanged, without resetting them to `--base`. A branch already checked out elsewhere, occupied destination, or handle collision is refused.
 
-```sh
-mkdir -p -m 0700 "$HOME/.config/cli/workmux"
-cp internal/workmux/Containerfile "$HOME/.config/cli/workmux/Containerfile"
-cp internal/workmux/.containerignore "$HOME/.config/cli/workmux/.containerignore"
-podman --remote=false build -f "$HOME/.config/cli/workmux/Containerfile" -t localhost/cli-workmux:fedora44 "$HOME/.config/cli/workmux"
+Names can identify a branch or unique worktree handle. Git discovery also supports manually created linked worktrees without prior Workmux JSON state. Name omission for merge, remove, or close requires being inside a linked worktree. `open` requires names unless `--new` is used. Ownership checks still protect unrelated tmux windows and directories.
+
+```text
+cli workmux add <branch> [--base <ref>] [-l|--layout <name>] [-b|--background]
+    [-o|--open-if-exists] [--name <handle>] [--dry-run]
+    [-H|--no-hooks] [-F|--no-file-ops] [-C|--no-pane-cmds]
+cli workmux open <name...> [--run-hooks] [--force-files] [-n|--new]
+cli workmux close [name]
+cli workmux merge [name] [--into <branch>] [-k|--keep|--cleanup] [--rebase|--squash]
+    [--ignore-uncommitted] [--no-verify] [-H|--no-hooks]
+cli workmux remove|rm [name...] [-k|--keep-branch] [-f|--force]
 ```
 
-The [Containerfile](internal/workmux/Containerfile) uses Fedora 44 and pins OpenCode 1.18.30. It verifies the release archive against a hardcoded SHA-256 for x86_64 or aarch64. The [release checksums and source reference](internal/workmux/upstream.md#image-and-isolated-tests) are recorded alongside it. `.containerignore` excludes the entire build context, and the image copies no host files. Keep it when building beside your configuration.
+`add --open-if-exists` opens an existing branch worktree. `--dry-run` reports the plan without provisioning. The three add skip flags suppress lifecycle hooks, file operations, or pane commands for that invocation. `open` focuses an existing window or creates one using current configuration. `--new` creates another window; `--force-files` reapplies file setup and `--run-hooks` reruns `post_create`. `close` closes the owned window and stops owned sandbox sessions without deleting the worktree or branch. Use `--` to end options and `cli workmux --help` for usage.
 
-The image includes Bash, Git, OpenCode, and common shell tools, but not `cli`, Go, or other language toolchains. Add tools needed by your project to your copied Containerfile and rebuild before creating workspaces.
+### Configuration and panes
 
-Unset Podman routing and storage overrides, including `CONTAINER_HOST`, `CONTAINER_CONNECTION`, and `CONTAINERS_STORAGE_CONF`. Errors name the rejected variable; even an exported empty value counts. Workmux never builds an image or pulls a missing image automatically.
+Each ordinary operation reads `~/.config/cli/workmux/config.yaml`, then `~/.config/cli/workmux/<repo-name>.yaml`. This literal location ignores `$XDG_CONFIG_HOME`; checkout YAML is never read. The repository name is the canonical main checkout's basename. Same-named repositories share config, not state or runtime ownership. `config` maps to `repo-config.yaml`; names beginning `repo-` gain another `repo-` prefix.
 
-Before the first sandbox, start OpenCode normally once on the host. OpenCode 1.18.30 tries to create `.gitignore` in its config directory during startup, even with no plugins. Workmux requires that file to be readable, regular, and neither symlinked nor hardlinked before it provisions a worktree. If the config directory already exists and only `.gitignore` is missing, you may explicitly create an empty file on the host:
-
-```sh
-touch -- "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/.gitignore"
-```
-
-Workmux never creates or rewrites this OpenCode metadata and never falls back to writable config. Plugins may need dependencies preinstalled on the host and tool paths available inside the image. Only a dependency-free local plugin has been integration-tested, not arbitrary plugins or external tools.
-
-### Configuration
-
-Workmux reads `~/.config/cli/workmux/config.yaml`, then `~/.config/cli/workmux/<repo-name>.yaml`. It always uses this literal `~/.config` location, regardless of `$XDG_CONFIG_HOME`. It never reads Workmux YAML from a checkout.
-
-The repository name is the basename of the canonical main checkout, not the linked worktree. Repositories with the same name share configuration but have separate state, container identities, and tmux ownership IDs. The name `config` maps to `repo-config.yaml`. Every name starting with `repo-` gains one more `repo-`, so `repo-config` maps to `repo-repo-config.yaml`.
-
-Missing files use defaults. Use `{}` for an empty file, not a blank document. This global example starts OpenCode and a shell in the sandbox. Enabling it shares your host OpenCode credentials and configuration as described under [Sandbox access and limits](#sandbox-access-and-limits). On an enforcing Fedora host, complete the [SELinux setup](#selinux-on-fedora) before `add`.
+Missing files, empty files, comment-only files, and a bare `---` document use defaults. Explicit top-level `null` and `~` are rejected, matching upstream. Optional null fields inherit; anchors and aliases work. YAML `<<` merge keys are ignored rather than merged.
 
 ```yaml
 # ~/.config/cli/workmux/config.yaml
@@ -155,14 +146,13 @@ panes:
     percentage: 30
 layouts:
   shell:
-    panes: []
+    panes: [{}]
 pre_merge: [git diff --check HEAD]
 sandbox:
   enabled: true
   image: localhost/cli-workmux:fedora44
+  target: agent
 ```
-
-For a checkout named `myapp`, an optional repository file can add local files and hooks:
 
 ```yaml
 # ~/.config/cli/workmux/myapp.yaml
@@ -173,153 +163,98 @@ post_create: ["<global>", git status --short]
 pre_remove: []
 ```
 
-The accepted top-level keys are `panes`, `files`, `layouts`, `post_create`, `pre_merge`, `pre_remove`, and `sandbox`.
+Top-level keys are `panes`, `files`, `layouts`, `post_create`, `pre_merge`, `pre_remove`, and `sandbox`. Sandbox fields are `enabled`, `image`, and `target`; obsolete runtime/container settings are rejected. There is no `agent` field or `<agent>` placeholder. Use a literal command such as `opencode`.
 
-`sandbox` accepts only `enabled` and `image`. There is no runtime setting. Remove the obsolete `sandbox.container` block from older YAML files; it is now an error.
+Repository lists replace global lists. Exact `"<global>"` entries splice the global hook or file list into a repository list, not pane commands. `[]` clears a list; `panes: []` leaves the initial tmux shell, and `panes: [{}]` explicitly requests one shell. Layouts merge by name with whole-layout replacement. Sandbox fields inherit individually, including explicit `enabled: false`.
 
-- Omitted keys inherit. Repository pane lists replace global panes. Hook lists and each file list also replace their global list.
-- An exact `"<global>"` entry inserts the corresponding global list at that position. It works only in repository hook lists, `files.copy`, and `files.symlink`, not in panes or command strings.
-- `[]` clears a hook or file list. `panes: []`, `panes: [{}]`, and an empty `command` all give a shell. Layouts merge by name, with a repository definition replacing the whole same-named layout. Sandbox fields inherit individually, including an explicit `enabled: false` override.
-- Unknown or duplicate keys, null values, YAML anchors, aliases, merge keys, and multiple documents are errors. There is no `agent` setting or `<agent>` expansion. Use an ordinary command such as `opencode`.
+Without pane configuration, two panes open: the first is a focused host shell; the second runs `clear` and splits horizontally. `horizontal` maps to tmux `-h`, side by side. `vertical` maps to `-v`, top and bottom. Every later pane requires `split`; it splits the previous pane unless `target` names an earlier zero-based pane index. The first pane cannot specify split, size, or percentage. Later panes may use `size` from 0 to 65535 cells or `percentage` from 1 to 100, not both. Explicit `size: 0` is accepted. `name` is accepted but ignored by tmux. Last focus wins; at most one pane may zoom, which also marks it focused.
 
-Each pane after the first splits the previous pane. `horizontal` puts the new pane below it and is the default; `vertical` puts it beside it. Set either a positive `size` in cells or `percentage` from 1 to 100, not both. The first pane cannot specify `split`. At most one pane may set `focus: true` and at most one may set `zoom: true`. Select a named layout with `add --layout shell`.
+Panes start with tmux's default shell. Configured commands use a login-shell handshake, then native command sending rather than a command followed by a replacement shell. Quitting an application returns to that same host shell without rerunning its startup files. Bootstrap may invoke an extra shell, so initialization is not promised to run exactly once during add. Host commands such as `exit` or `exec` retain their normal effects. Final shell exit closes the pane normally unless your own `remain-on-exit` setting keeps it visible; Workmux does not force that setting.
 
-File patterns are relative to the main checkout and support globs, including `**`. Directories copy recursively; `files.symlink` creates links back to real files or directories in the main checkout. Those targets are read-only inside the sandbox. Both operations reject source symlinks, including symlinked parents or entries inside a selected directory. Absolute paths, `..`, `.git` paths, overlapping selections, and existing destinations are rejected. An unmatched pattern prints a warning. Use these lists for files absent from the new worktree, often ignored local files, and review secrets such as `.env` before sharing them.
+### Files and host hooks
 
-Hooks run sequentially in the workspace directory and stop on the first failure. `post_create` runs after file setup and container startup, before panes. `pre_merge` runs before merging; `pre_remove` runs before cleanup, including forced removal. Hooks and nonempty pane commands use `bash -c` on the host or inside the sandbox. Sandbox hooks have no TTY; empty sandbox panes use interactive Bash, and empty host panes use tmux's default shell. Host hooks with terminal stdin retain the foreground process group so they can read input. Other host hooks use a separate group that is killed on cancellation. Output-pipe waiting after cancellation is bounded to one second; detached background jobs may still survive.
+Patterns select paths in the main checkout and support globs including `**`. Absolute patterns must remain lexically inside that checkout; `..` components are rejected. Copies overwrite existing files, merge directories, and preserve regular-file permissions. A directly selected source symlink is followed, while symlinks encountered recursively retain their target text. User-selected source links can resolve outside the checkout. Review patterns and secrets before sharing them.
 
-Hooks receive `WM_HANDLE`, `WM_WORKTREE_PATH`, `WM_PROJECT_ROOT`, `WM_CONFIG_DIR`, `WM_BRANCH_NAME`, and `WM_TARGET_BRANCH`, plus `WORKMUX_HANDLE` as an alias for `WM_HANDLE`. `WM_PROJECT_ROOT` is the main checkout. `WM_TARGET_BRANCH` is empty unless a merge has selected one. `WM_CONFIG_DIR` names the external Workmux configuration directory, which is not automatically mounted inside the sandbox.
+`files.symlink` explicitly replaces the destination with a relative link to the source in the main checkout. Destination-parent checks prevent following unrelated destination symlinks. Special copy sources and unmatched patterns are skipped without warnings. File setup is not limited to absent or ignored files and may overwrite tracked destinations.
 
-### SELinux on Fedora
+Hooks always run on the host with `bash -c` in the worktree, regardless of sandbox settings. They run sequentially and stop on failure. `post_create` follows file setup and precedes panes; `pre_merge` precedes merging; `pre_remove` precedes cleanup. Unset `pre_remove` uses the upstream Node cleanup script when the main checkout contains a supported npm, pnpm, or Yarn lockfile. `pre_remove: []` disables that default.
 
-Workmux leaves host labels unchanged. It never adds `:z`, `:Z`, or `label=disable`, and it does not change host ownership recursively. On an enforcing host, a bind mount can fail even when Unix permissions are correct. Check the denial and the exact source path rather than disabling SELinux.
+Hooks receive `WM_HANDLE`, `WM_WORKTREE_PATH`, `WM_PROJECT_ROOT`, `WM_CONFIG_DIR`, `WM_BRANCH_NAME`, `WM_TARGET_BRANCH`, and alias `WORKMUX_HANDLE`. The target is empty outside a selected merge. Host hooks with terminal input can read it. Cancellation does not guarantee that detached background jobs stop.
 
-One opt-in approach is to pre-label only the chosen checkout, its sibling worktree directory, the actual OpenCode directories, and the sandbox snapshot directory with `container_file_t`. This recursively changes labels on host files. It uses a shared container label, not a private label for each workspace, and may affect access by other confined applications or containers. Review the paths and credentials before doing it, or ask an administrator to arrange a narrower policy.
+### Sandbox setup and access
 
-The following example assumes an existing checkout at `$HOME/dev/myapp`. Replace that path and its `myapp__worktrees` sibling with your reviewed paths. XDG overrides below must be absolute and point outside the repository. Do not substitute your entire home, `~/.config`, `~/.local/share`, a system directory, or all application state. Existing Workmux state and worktree-parent directories must already be private; `mkdir -p` does not fix their modes.
+Build the image explicitly from this checkout. Workmux uses Podman only and respects its native connection and storage environment, including remote connection settings. It does not force `--remote=false`, reject those variables, build images, or pull missing images. Use the engine/image store that will run your panes.
 
 ```sh
-mkdir -p -m 0700 "$HOME/dev/myapp__worktrees"
-mkdir -p -m 0700 "${XDG_DATA_HOME:-$HOME/.local/share}/opencode"
-mkdir -p -m 0700 "${XDG_STATE_HOME:-$HOME/.local/state}/cli/workmux"
-mkdir -p -m 0700 "${XDG_STATE_HOME:-$HOME/.local/state}/cli/workmux/containers"
-chcon -R -t container_file_t -- "$HOME/dev/myapp"
-chcon -R -t container_file_t -- "$HOME/dev/myapp__worktrees"
-chcon -R -t container_file_t -- "${XDG_DATA_HOME:-$HOME/.local/share}/opencode"
-chcon -R -t container_file_t -- "${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
-chcon -R -t container_file_t -- "${XDG_STATE_HOME:-$HOME/.local/state}/cli/workmux/containers"
+podman info
+podman build --no-cache -f internal/workmux/Containerfile -t localhost/cli-workmux:fedora44 internal/workmux
 ```
 
-Review labels again after moving files into these directories or a system relabel. `chcon` is not a persistent SELinux policy rule. See Podman's [bind-mount labeling notes](https://docs.podman.io/en/latest/markdown/podman-run.1.html) for the effects of shared labels. Production Workmux does none of this automatically.
+The [Containerfile](internal/workmux/Containerfile) uses Fedora 44 and the official `https://opencode.ai/install` script to install latest OpenCode. It runs Bash with `HOME=/root` and `--no-modify-path`, installs the binary into `/usr/local/bin`, then cleans up. There is no version pin or architecture case table. `.containerignore` excludes host build-context files. The build does not modify host configuration. `--no-cache` reruns the installer to fetch latest; cached builds can retain an older binary. There is no automatic runtime update. The image includes common shell tools, not `cli`, Go, or project-specific toolchains.
 
-### Work with a branch
+With sandboxing enabled, `target: agent` is the default. Recognized executable stems are `claude`, `gemini`, `agy`, `opencode`, `codex`, `pi`, `omp`, `kiro-cli`, `vibe`, and `grok`. Recognition supports assignment/`env` prefixes and executable symlink resolution, not arbitrary shell wrappers. Ordinary `nvim`, development commands, and empty shell panes stay on the host. `target: all` also sandboxes nonempty non-agent commands, including default `clear`; omitted and empty commands still leave host shells.
 
-From the main checkout, start a host tmux session if you are not already in one, then create a workspace:
-
-```sh
-tmux new-session -s dev
-cli workmux add feature/login --base main
-```
-
-For `/home/me/dev/myapp`, this creates `/home/me/dev/myapp__worktrees/feature-login` and a window named `feature-login`. The branch stays `feature/login`. `add` prints the worktree path and focuses the window. `--background` creates it without switching focus, but still requires a live tmux pane.
-
-New branches start at the current worktree's `HEAD` unless `--base` is supplied. An existing local branch is reused unchanged, and then `--base` is an error. A branch already checked out elsewhere, an occupied destination, or a slash-to-dash name collision is refused.
-
-Edit and commit with normal Git commands in the workspace. Lifecycle commands accept the branch or its unique slash-to-dash handle. Omit the name only when the host shell's current directory is inside that managed worktree.
-
-To stop work and return later:
-
-```sh
-cli workmux close feature/login
-cli workmux open feature/login
-```
-
-`close` stops the container and closes the tmux window without deleting the worktree or branch. `open` focuses an existing window, or restarts the saved container and recreates the saved panes on the original tmux server. Container-only files survive close/open, but container processes do not. An exited pane stays visible; use close/open to restart its command.
-
-Once changes are committed and both source and target worktrees are clean:
-
-```sh
-cli workmux merge feature/login
-```
-
-This performs a normal Git merge followed by workspace cleanup. It neither squashes nor rebases. The target is the local branch named by `origin/HEAD`, falling back to `main`, then `master`. Use `--into <branch>` to choose another local target checked out in another worktree. `--keep` skips cleanup and retains the window, worktree, branch, and container for further work. Merge conflicts preserve the workspace; resolve or abort the Git operation in the reported target path, then retry.
-
-To remove a workspace without merging, use `remove`. `--keep-branch` preserves its branch and committed work, including unmerged commits, but does not permit losing dirty files:
-
-```sh
-cli workmux remove feature/login --keep-branch
-```
-
-Without `--keep-branch`, removal requires the branch to be safely merged into the detected target or the target recorded by a prior merge. `--force` explicitly permits discarding dirty files and deleting an unmerged branch. Combine it with `--keep-branch` to retain commits while discarding worktree files. Force does not skip hooks, unfinished Git operations, locks, or ownership checks. Back up any needed container-only files before removal.
-
-Cleanup automatically closes the owned source window before deleting the worktree, branch, and container. There is no need to close it manually first. From another host window or shell, cleanup waits for the window to disappear and completes before returning. From a host pane in the source window itself, it hands cleanup to a detached worker and prints `cleanup scheduled` or `merge succeeded; cleanup scheduled`. That is not completion. If the scheduling message cannot be written, the worker is not armed to delete anything.
-
-The worker closes its source window shortly afterward. Cleanup waits up to five seconds for window closure and rechecks the captured tmux and worktree identities before deleting files. Sandbox cleanup stops all container execution before closing the window. Detached host jobs can survive tmux closure; stop them yourself before cleanup.
-
-Merge ignores ignored files, but cleanup is stricter. Unknown or changed ignored files block deletion. Only unchanged ignored files installed by `add` may be removed automatically. Build artifacts created by hooks or tests, including Go test outputs, can therefore leave a successful merge with cleanup still pending. Move out files you need and retry `remove`. If you have reviewed everything and intend to discard it, explicitly use `cli workmux remove <name> --force`. There is no `merge --force`.
-
-Use `cli workmux --help` or `cli workmux help <command>` for usage. `--` ends option parsing.
-
-### Sandbox access and limits
-
-OpenCode is an ordinary pane command. Workmux adds no permission-bypass flags. It automatically mounts these whole directories for every sandbox, even one with only shell panes:
+Each selected command runs in its own `podman run --rm -it` session. Quitting it removes its container writable layer and returns to the existing host shell. There is no persistent shared container, guest-shell fallback, or sandbox lifecycle hook. Keep files in bind-mounted paths if they must survive. A failed sandbox launch does not run the application on the host.
 
 | Host directory | Guest directory | Access |
 | --- | --- | --- |
 | `$XDG_DATA_HOME/opencode`, default `~/.local/share/opencode` | `/tmp/.local/share/opencode` | Read-write |
-| `$XDG_CONFIG_HOME/opencode`, default `~/.config/opencode` | `/tmp/.config/opencode` | Read-only |
+| `$XDG_CONFIG_HOME/opencode`, default `~/.config/opencode` | `/tmp/.config/opencode` | Read-only, if present |
 
-Unlike Workmux's own YAML location, these mounts honor XDG overrides and reject relative paths. Missing data directories are created with mode `0700`; config must already meet the `.gitignore` prerequisite. Authenticate OpenCode on the host before using it in a workspace. The guest can read and change all OpenCode data, including credentials. Host file edits, credential rotation, and configuration changes are visible through the directory mounts. All workspaces share them.
+These automatic mounts honor absolute XDG overrides. Missing data directories may be created. Missing host config is not created or mounted; the guest can initialize its own config. No host `.gitignore` is required by Workmux. Older OpenCode builds have failed with existing empty read-only config, but that is not a claim that latest always needs preinitialized host files. Shared credentials are accessible to the guest; sharing does not perform login or validate providers. Host state and cache are not mounted.
 
-The guest uses `HOME=/tmp` and XDG data, config, state, and cache locations under `/tmp`. Host state and cache directories are not shared. Workmux does not mount the host home directory, engine socket, SSH keys or agent, or tmux socket, and it does not forward the general host environment or arbitrary API-key variables. Effective Git `user.name` and `user.email` supply author and committer identity. The guest runs as the host's numeric UID:GID with all capabilities dropped and `no-new-privileges`; Podman uses `--userns=keep-id`.
+The guest uses `HOME=/tmp`, XDG paths under `/tmp`, and the host's numeric UID:GID with `--userns=keep-id`. Workmux does not automatically mount the host home, engine/tmux sockets, SSH keys or agent, or forward arbitrary host API keys. It supplies effective Git name/email identity. The worktree is writable; common Git metadata uses read-only mounts with selected writable data/admin overlays. Git modules and includes use protected snapshots, not a fully writable `.git` directory.
 
-The linked worktree is writable. The main checkout and common Git directory are read-only, with writable mounts for shared objects, refs, logs, an existing `rr-cache`, and this worktree's Git administration directory. Git config snapshots, pointer files, hooks, and policy directories remain read-only. Snapshots preserve Git config values but omit `core.worktree` and include directives. Repository Git config includes are rejected outright, not silently followed or made safe by stripping them.
+This is not branch-level or strict host-execution isolation. Shared refs can change other branches. Host hooks, builds, filters, merge drivers, and plugins may execute agent-written content later. Networking uses Podman's default. SELinux labels and ownership remain unchanged, without automatic relabeling or `label=disable`; arrange suitable policy for reviewed bind paths on enforcing hosts. Real macOS and remote Podman have not been exercised; native connection argv support is not a tested remote deployment.
 
-The sandbox rejects submodules, nested repositories, unsafe Git layouts, symlinked mount sources or policy files, symbolic links in writable Git data, host submounts, and sockets, devices, or pipes in mounted directory trees. Hardlinks in every writable bind source are rejected, including Git objects, worktree files, and OpenCode data. Use `git clone --no-hardlinks` for local clones. Workmux does not repair linked files on the host. OpenCode data symlinks must be relative and resolve inside that data directory. OpenCode directories and private state must not overlap repository mounts. Bare repositories and separate main Git directories are unsupported. See the [source reference and detailed limits](internal/workmux/upstream.md) for details.
-
-This is not branch-level or strict host-execution isolation. Shared refs let the guest change any branch, not only its workspace branch. The host may later execute agent-written content through Git filters, merge drivers, hooks, builds, plugins, or other tools. Review content before running host operations on it. Git snapshots can contain secrets, as can external hook configuration and saved state. Access to OpenCode credentials is deliberate. Networking uses the engine's unrestricted default; Workmux adds no firewall or proxy.
-
-### Saved configuration and recovery
-
-`add` saves the effective configuration and selected layout with the workspace. Later operations use those saved panes, sandbox settings, and hooks. `open` never reruns file setup or `post_create`, and edits to pane or hook configuration affect only new workspaces.
-
-`open` also loads the current external configuration and refuses it if the effective sandbox `enabled` or `image` differs from the saved values. Restore them, or preserve your work and remove/recreate the workspace to adopt new settings. Close, merge, and remove use the saved settings. Changes to the image ID, mount paths, protected Git policy, or injected Git identity can require container recreation. Container labels and private endpoint records also pin the local Podman storage identity. Restore the original storage if it changes, including for close or remove.
-
-Existing saved Podman workspaces load without manual state edits, including records with an empty legacy runtime. New saves omit the old container setting. Disabled legacy workspaces also load without a backend choice. An enabled workspace saved with another backend is refused before any container operation; recover it with the previous implementation rather than changing its state to claim Podman ownership.
-
-State directories use mode `0700`; JSON records, locks, cleanup logs, endpoint records, and Git config snapshots use `0600`. A per-repository `flock` serializes Workmux commands, not Git or other writers. Completed removals retain a recovery record; container snapshots and endpoint records remain under the state's `containers` subtree.
-
-The scheduling notice gives the private log path, `<state-dir>/<repo-id>/<workspace-id>.<token>.cleanup.log`. It records fixed phase diagnostics, not hook commands or subprocess stderr. `complete` marks finished cleanup. `merge succeeded; cleanup incomplete` means the Git merge succeeded but cleanup did not finish. Inspect the error or log and retry `remove` from a surviving host shell in the repository.
-
-If a worker never starts or is killed, retry `remove` after its 20-second handoff lease expires. The lease limits readiness and lock waiting, not cleanup execution. A running worker holds the repository lock. `close` can cancel an unclaimed cleanup and close the window while preserving the worktree; retry `remove` to finish later.
-
-Other failures report the saved stage and preserve remaining work. Incomplete file or hook setup cannot resume with `open`; preserve needed files, remove the partial workspace, and add it again. A pane-creation failure after setup can use close/open. Retry `close` if that command failed to close its window. Do not delete state to bypass checks. For damaged snapshots, follow the [recovery notes](internal/workmux/upstream.md) and never remove snapshots used by a live container.
-
-### Integration tests
-
-The isolated real-tmux and container tests passed with tmux 3.7c and Podman 5.8.4 on x86_64. The ARM64 image remains untested with a real engine.
-
-The container test is opt-in and needs the image built above. From this checkout's root:
+### Merge and remove safely
 
 ```sh
-export WORKMUX_CONTAINER_TEST=1
-export WORKMUX_CONTAINER_IMAGE=localhost/cli-workmux:fedora44
-go test ./internal/workmux -run '^TestContainerIntegration$' -count=1 -v
+cli workmux merge feature/login --keep
+cli workmux merge feature/login --into main
+cli workmux remove feature/login --keep-branch
 ```
 
-On an enforcing SELinux host, use this variant to explicitly allow relabeling only the test's own temporary directory:
+Ordinary merge commits staged source changes interactively using Git's editor selection, including `EDITOR`. It does not stage other files. Host Git suppresses Git hooks and signing through its protected constructor. Without `--keep` or `--ignore-uncommitted`, unstaged and nonignored untracked source files block merge. `--keep` allows those files and retains the worktree, branch, and windows.
+
+`--ignore-uncommitted` skips the staged commit too and merges the existing HEAD, not uncommitted changes. Without `--keep`, successful cleanup can discard those staged, unstaged, and untracked files. Ignored artifacts have no extra hash gate and may be removed during cleanup. Back up anything needed before choosing cleanup.
+
+Default strategy is a normal merge followed by cleanup. `--cleanup` explicitly selects that default and conflicts with `--keep`. `--rebase` first rebases the source; `--squash` stages a squash in the target and commits it interactively. The two strategies are mutually exclusive. `--no-verify` skips only Workmux's `pre_merge` hook, not every hook; `--no-hooks` skips all lifecycle hooks for the operation.
+
+A fresh target is `--into`, then a usable saved local base, then the local branch corresponding to `origin/HEAD`, then `main` or `master`. A saved tag or commit is not a local merge target. Retries retain their recorded destination. Workmux uses the target's existing worktree or switches the main checkout to it and leaves it there. Tracked target changes and unfinished operations block merging; Git collision checks and ignored-target protection remain.
+
+Normal merge failure attempts a guarded abort in the target. Squash failure uses guarded squash recovery; failed squash commits retain staged target changes for retry. Failed rebases stay in the source for manual continue or abort. If abort is unsafe or fails, inspect the reported path and recovery state before retrying. No successful cleanup is claimed on merge failure.
+
+`remove` normally removes the worktree and branch. Unmerged commits require `[y/N]` confirmation unless `--keep-branch` or `--force` is supplied. `--keep-branch` retains committed work, not dirty files. `--force` permits discarding dirty files and unmerged commits but does not bypass hooks, locks, unfinished Git operations, or ownership checks.
+
+Cleanup closes owned windows before deleting the worktree. From inside an owned window it hands off to a detached worker and reports `cleanup scheduled`, not completion. Inspect the reported private cleanup log and retry `remove` after a failed handoff expires. `merge succeeded; cleanup incomplete` means the merge is already done. Ref and filesystem identities are rechecked; changed refs preserve the branch even if worktree removal already completed. Detached host jobs may survive tmux closure.
+
+### Legacy migration and recovery
+
+Old records with a nonempty saved container name still represent persistent containers. Creating a new sandbox pane refuses them rather than silently deleting container-local data. `close` stops the owned legacy container and keeps its local data; explicit `remove` deletes it. Legacy endpoint records protect access to the original Podman store. Do not edit JSON or erase endpoint records to bypass ownership checks.
+
+Before migration, back up needed container-local files and commit or externally back up every worktree change, including ignored files. From another surviving host shell:
 
 ```sh
-WORKMUX_CONTAINER_RELABEL_TEST=1 go test ./internal/workmux -run '^TestContainerIntegration$' -count=1 -v
+cli workmux remove feature/login --keep-branch
+# Wait for cleanup completion before recreating.
+cli workmux add feature/login
 ```
 
-The test uses an isolated repository, fake OpenCode data/config, and a uniquely named container that it removes afterward. It checks OpenCode 1.18.30 startup with `opencode serve` and `/config`, including initialization of a dependency-free local plugin through the read-only config mount. No provider API calls or model inference run, and it never reads your credentials or writes your configuration. `WORKMUX_CONTAINER_RELABEL_TEST=1` permits `chcon` only on the test fixture, not production paths.
+Reuse `--name <handle>` if you chose a custom handle. `--keep-branch` is not a dirty-file backup, and re-add does not restore container-local files. Do not use `--force` unless discarding remaining worktree data is intentional. Existing windows keep their launch behavior until closed; reopening uses fresh config, not the old saved pane layout.
 
-These tests use isolated tmux servers and sockets, including cleanup launched from the workspace's own window:
+Normal operations reload config, while unfinished merge/cleanup journals retain their recovery inputs. Private state uses `0700` directories and `0600` records with per-repository locks. Those locks do not serialize ordinary Git commands or other filesystem writers.
+
+If a recorded worktree disappears, change to a surviving checkout and run `remove <name>`. Orphan recovery skips `pre_remove`, preserves a surviving branch even with force, and retires only validated owned resources and stale Git metadata. It does not globally prune Git registrations or delete replacement directories. `add` can retire metadata-only orphans only when registration and runtime resources are absent. Missing engine access or a live inaccessible tmux server blocks recovery rather than proving absence. `open` cannot recreate a missing worktree; complete removal, then re-add.
+
+### Verification
 
 ```sh
-go test ./internal/workmux -run '^TestTmuxIsolatedServerQuickCommandsAndRename$' -count=1 -v
-go test ./internal/workmux -run '^TestCleanupActualSelfWindowProcess$' -count=1 -v
+go test ./internal/workmux -count=1
+WORKMUX_UPSTREAM_BIN=/absolute/path/to/workmux go test ./internal/workmux -run '^TestUpstreamCompatibility$' -count=1 -v
+WORKMUX_CONTAINER_TEST=1 WORKMUX_CONTAINER_IMAGE=localhost/cli-workmux:fedora44 go test ./internal/workmux -run '^TestContainerIntegration$' -count=1 -v
 ```
 
-The real-tmux tests also run during ordinary tests when tmux 3.2+ is installed; `-short` skips them. The real-container test requires `WORKMUX_CONTAINER_TEST` and is not skipped by `-short` once enabled.
+The optional upstream binary must be the native reference build above. Differential tests use isolated Git/tmux fixtures and temporary homes, not user configuration or provider credentials. They cover selected shell, split, file, config, base/merge, reopen, and manual-worktree cases, not all upstream flags. Local tests also cover lifecycle phases, ownership, unknown commands, sandbox selection, and recovery.
+
+Real tmux tests run when available and skip under `-short`; explicit upstream tests require tmux and reject `-short`. Container tests need an explicitly built image. They capture its OpenCode version dynamically and validate health plus resolved config for fresh guest-owned config, as well as read-only host config and a local plugin. They use fake credentials without provider requests. On enforcing SELinux hosts, `WORKMUX_CONTAINER_RELABEL_TEST=1` allows relabeling only the test fixture. Bash/native shell tests exist; fish, zsh, and nu execution is not claimed when tools are unavailable. See [verification details](internal/workmux/upstream.md#image-and-verification).

@@ -218,7 +218,7 @@ func discoverSandboxGit(worktree, common string) (sandboxGitIdentity, error) {
 
 func (c *Containers) mountPlan(ctx context.Context, w Workspace, image string, create bool) (sandboxMountPlan, error) {
 	var plan sandboxMountPlan
-	if err := c.checkOpenCodeConfig(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return plan, err
 	}
 	identity, err := discoverSandboxGit(w.Path, w.CommonDir)
@@ -255,17 +255,6 @@ func (c *Containers) mountPlan(ctx context.Context, w Workspace, image string, c
 		}
 	}
 	if err := plan.gitBoundary(ctx, c, identity, create); err != nil {
-		return plan, err
-	}
-	if err := plan.writableMounts(ctx, w); err != nil {
-		return plan, err
-	}
-	for _, path := range []string{w.Root, w.CommonDir, w.Path} {
-		if err := sandboxNoSockets(ctx, path); err != nil {
-			return plan, err
-		}
-	}
-	if err := sandboxNoSubmounts(ctx, plan.Mounts); err != nil {
 		return plan, err
 	}
 	identityEnv, err := c.gitIdentityEnv(ctx, w.Path)
@@ -315,40 +304,6 @@ func (c *Containers) openCodeConfigDir() (string, error) {
 	return filepath.Join(path, "opencode"), nil
 }
 
-func (c *Containers) checkOpenCodeConfig(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	dir, err := c.openCodeConfigDir()
-	if err != nil {
-		return fmt.Errorf("resolve OpenCode config directory: %w", err)
-	}
-	path := filepath.Join(dir, ".gitignore")
-	if err := sandboxReadableFile(path); err != nil {
-		return fmt.Errorf("OpenCode read-only config requires a readable regular .gitignore without links at %q; initialize OpenCode once on the host or create .gitignore in %q, then retry: %w", path, dir, err)
-	}
-	return nil
-}
-
-func sandboxReadableFile(path string) error {
-	before, err := sandboxRegular(path)
-	if err != nil {
-		return err
-	}
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return err
-	}
-	after, statErr := file.Stat()
-	if err := errors.Join(statErr, file.Close()); err != nil {
-		return err
-	}
-	if !os.SameFile(before, after) || !after.Mode().IsRegular() || after.Sys().(*syscall.Stat_t).Nlink != 1 {
-		return fmt.Errorf("file changed while checking readability: %s", path)
-	}
-	return nil
-}
-
 func (c *Containers) credentialMounts(ctx context.Context, w Workspace, plan *sandboxMountPlan, create bool) error {
 	if err := sandboxDirectory(c.HomeDir, false, false); err != nil {
 		return fmt.Errorf("sandbox home: %w", err)
@@ -394,10 +349,19 @@ func (c *Containers) credentialMounts(ctx context.Context, w Workspace, plan *sa
 		return err
 	}
 	for i, path := range []string{data, config} {
-		if err := sandboxDirectory(path, create, false); err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := sandboxNoSockets(ctx, path); err != nil {
+		if i == 1 {
+			exists, err := sandboxOptional(path)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				continue
+			}
+		}
+		if err := sandboxDirectory(path, create && i == 0, false); err != nil {
 			return err
 		}
 		target := "/tmp/.local/share/opencode"
@@ -467,29 +431,8 @@ func sandboxOptional(path string) (bool, error) {
 	return err == nil, err
 }
 
-func sandboxEmptyNamespace(path string) error {
-	exists, err := sandboxOptional(path)
-	if err != nil || !exists {
-		return err
-	}
-	if err := sandboxDirectory(path, false, false); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return err
-	}
-	if len(entries) != 0 {
-		return fmt.Errorf("sandbox does not support submodules or nested Git administrative namespaces: %s", path)
-	}
-	return nil
-}
-
 func (plan *sandboxMountPlan) gitBoundary(ctx context.Context, c *Containers, identity sandboxGitIdentity, create bool) error {
-	if err := sandboxEmptyNamespace(filepath.Join(identity.Common, "modules")); err != nil {
-		return err
-	}
-	if err := sandboxWorktreePointers(ctx, identity.Worktree); err != nil {
+	if err := plan.worktreePointers(ctx, identity.Worktree); err != nil {
 		return err
 	}
 	if err := plan.bind(identity.Pointer, true); err != nil {
@@ -517,13 +460,10 @@ func (plan *sandboxMountPlan) gitBoundary(ctx context.Context, c *Containers, id
 		if err := sandboxDirectory(path, create, false); err != nil {
 			return err
 		}
-		if filepath.Base(path) == "modules" || filepath.Base(path) == "worktrees" {
-			if err := sandboxEmptyNamespace(path); err != nil {
+		if filepath.Base(path) != "modules" && filepath.Base(path) != "worktrees" {
+			if err := plan.policyTree(ctx, path); err != nil {
 				return err
 			}
-		}
-		if err := plan.policyTree(ctx, path); err != nil {
-			return err
 		}
 		if err := plan.bind(path, true); err != nil {
 			return err
@@ -563,6 +503,11 @@ func (plan *sandboxMountPlan) gitBoundary(ctx context.Context, c *Containers, id
 			return err
 		}
 	}
+	for _, root := range []string{identity.Common, identity.Admin} {
+		if err := plan.moduleRoots(ctx, c, identity, filepath.Join(root, "modules"), create); err != nil {
+			return err
+		}
+	}
 	return sandboxOtherAdmins(ctx, identity)
 }
 
@@ -596,77 +541,22 @@ func sandboxOtherAdmins(ctx context.Context, identity sandboxGitIdentity) error 
 	return nil
 }
 
-func sandboxWorktreePointers(ctx context.Context, worktree string) error {
+func (plan *sandboxMountPlan) worktreePointers(ctx context.Context, worktree string) error {
 	return sandboxWalk(ctx, worktree, func(path string, entry fs.DirEntry) error {
-		if entry.Name() == ".gitmodules" {
-			return fmt.Errorf("sandbox does not support submodules: %s", path)
-		}
-		if entry.Name() == ".git" && path != filepath.Join(worktree, ".git") {
-			return fmt.Errorf("sandbox does not support nested repositories or submodule Git pointers: %s", path)
+		if entry.Name() == ".git" {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			if _, err := sandboxRegular(path); err != nil {
+				return err
+			}
+			return plan.bind(path, true)
 		}
 		return nil
 	})
-}
-
-func (plan sandboxMountPlan) writableMounts(ctx context.Context, w Workspace) error {
-	for _, mount := range plan.Mounts {
-		if mount.ReadOnly {
-			continue
-		}
-		var allowLink func(string) error
-		switch mount.Target {
-		case w.Path:
-			// Mirrored repository links do not add host mounts; main-tree links remain useful.
-			allowLink = func(string) error { return nil }
-		case "/tmp/.local/share/opencode":
-			allowLink = func(path string) error { return sandboxDataSymlink(mount.Source, path) }
-		}
-		if err := sandboxWritableTree(ctx, mount.Source, allowLink); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func sandboxWritableTree(ctx context.Context, root string, allowLink func(string) error) error {
-	return sandboxWalk(ctx, root, func(path string, entry fs.DirEntry) error {
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			if allowLink == nil {
-				return fmt.Errorf("writable Git data must not contain symbolic links: %s", path)
-			}
-			return allowLink(path)
-		}
-		if info.Mode().IsRegular() {
-			if info.Sys().(*syscall.Stat_t).Nlink != 1 {
-				return fmt.Errorf("writable sandbox files must not have hard links: %s; use git clone --no-hardlinks or replace linked files with independent copies outside cli before retrying", path)
-			}
-		} else if !info.IsDir() {
-			return fmt.Errorf("sandbox will not expose host sockets, devices or pipes in writable mounts: %s", path)
-		}
-		return nil
-	})
-}
-
-func sandboxDataSymlink(root, path string) error {
-	value, err := os.Readlink(path)
-	if err != nil {
-		return err
-	}
-	if filepath.IsAbs(value) || !sandboxWithin(root, filepath.Join(filepath.Dir(path), value)) {
-		return fmt.Errorf("OpenCode data symbolic links must stay relative and inside the shared data directory: %s", path)
-	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return fmt.Errorf("OpenCode data symbolic links must resolve inside the shared data directory: %s: %w", path, err)
-	}
-	if !sandboxWithin(root, resolved) {
-		return fmt.Errorf("OpenCode data symbolic link escapes the shared data directory: %s", path)
-	}
-	return nil
 }
 
 func sandboxWalk(ctx context.Context, root string, visit func(string, fs.DirEntry) error) error {
@@ -685,39 +575,6 @@ func sandboxWalk(ctx context.Context, root string, visit func(string, fs.DirEntr
 		}
 		return ctx.Err()
 	})
-}
-
-func sandboxNoSockets(ctx context.Context, path string) error {
-	return sandboxWalk(ctx, path, func(path string, entry fs.DirEntry) error {
-		if entry.Type()&(os.ModeSocket|os.ModeDevice|os.ModeNamedPipe) != 0 {
-			return fmt.Errorf("sandbox will not expose host sockets, devices or pipes: %s", path)
-		}
-		return nil
-	})
-}
-
-func sandboxNoSubmounts(ctx context.Context, mounts []sandboxMount) error {
-	data, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		return fmt.Errorf("inspect host mount boundaries: %w", err)
-	}
-	unescape := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
-	for line := range strings.SplitSeq(string(data), "\n") {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			continue
-		}
-		path := unescape.Replace(fields[4])
-		for _, mount := range mounts {
-			if path != mount.Source && sandboxWithin(mount.Source, path) {
-				return fmt.Errorf("host submounts cannot be safely exposed by the sandbox: %s", path)
-			}
-		}
-	}
-	return nil
 }
 
 func parseSandboxConfig(data []byte) ([]sandboxConfigEntry, error) {
@@ -779,22 +636,12 @@ func serializeSandboxConfig(entries []sandboxConfigEntry) ([]byte, error) {
 }
 
 func (plan *sandboxMountPlan) configSnapshot(ctx context.Context, c *Containers, identity sandboxGitIdentity, path string) error {
-	output, err := c.Runner.Run(ctx, Process{Name: "git", Args: []string{"config", "--file", path, "--null", "--list", "--no-includes"}, Dir: "/", CleanGitEnv: true, Env: []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}})
-	if err != nil {
-		return fmt.Errorf("inspect Git config %s: %w", path, err)
-	}
-	entries, err := parseSandboxConfig(output)
+	entries, err := c.gitConfig(ctx, path)
 	if err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		key := strings.ToLower(entry.Key)
-		if key == "include.path" || strings.HasPrefix(key, "includeif.") {
-			return fmt.Errorf("sandbox does not support repository Git config includes; remove %s from %s", entry.Key, path)
-		}
-		if err := plan.executablePolicy(ctx, identity, path, key, entry.Value); err != nil {
-			return err
-		}
+	if err := plan.configPolicy(ctx, c, identity, path, entries, make(map[string]bool)); err != nil {
+		return err
 	}
 	content, err := serializeSandboxConfig(entries)
 	if err != nil {
@@ -802,6 +649,191 @@ func (plan *sandboxMountPlan) configSnapshot(ctx context.Context, c *Containers,
 	}
 	plan.Mounts = append(plan.Mounts, sandboxMount{Source: path, Target: path, ReadOnly: true, Snapshot: true, Content: content})
 	return plan.input(path, true)
+}
+
+func (c *Containers) gitConfig(ctx context.Context, path string) ([]sandboxConfigEntry, error) {
+	if _, err := sandboxRegular(path); err != nil {
+		return nil, err
+	}
+	args := make([]string, 0, len(gitProtection)*2+6)
+	for _, setting := range gitProtection {
+		args = append(args, "-c", setting)
+	}
+	args = append(args, "config", "--file", path, "--null", "--list", "--no-includes")
+	out, err := c.Runner.Run(ctx, Process{Name: "git", Args: args, Dir: "/", CleanGitEnv: true, Env: []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}})
+	if err != nil {
+		return nil, fmt.Errorf("inspect Git config %s: %w", path, err)
+	}
+	return parseSandboxConfig(out)
+}
+
+func (plan *sandboxMountPlan) configPolicy(ctx context.Context, c *Containers, identity sandboxGitIdentity, path string, entries []sandboxConfigEntry, visited map[string]bool) error {
+	if visited[path] {
+		return nil
+	}
+	visited[path] = true
+	for _, entry := range entries {
+		key := strings.ToLower(entry.Key)
+		include := key == "include.path" || strings.HasPrefix(key, "includeif.") && strings.HasSuffix(key, ".path")
+		if !include {
+			if err := plan.executablePolicy(ctx, identity, path, key, entry.Value); err != nil {
+				return err
+			}
+			continue
+		}
+		value := entry.Value
+		if value == "" || strings.ContainsAny(value, "*?[%") {
+			return fmt.Errorf("git config include path cannot be protected safely: %q", value)
+		}
+		if strings.HasPrefix(value, "~/") {
+			value = c.HomeDir + string(filepath.Separator) + value[2:]
+		}
+		if !filepath.IsAbs(value) {
+			value = filepath.Dir(path) + string(filepath.Separator) + value
+		}
+		value, err := sandboxResolvePolicy(value)
+		if err != nil {
+			return fmt.Errorf("git config include target must exist and be safe before sandbox startup: %w", err)
+		}
+		included, err := c.gitConfig(ctx, value)
+		if err != nil {
+			return fmt.Errorf("git config include target must exist and be safe before sandbox startup: %w", err)
+		}
+		if err := plan.configPolicy(ctx, c, identity, value, included, visited); err != nil {
+			return err
+		}
+		if sandboxWithin(identity.Worktree, value) || sandboxWithin(identity.Common, value) {
+			if err := plan.bind(value, true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func sandboxResolvePolicy(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve Git policy %s: %w", path, err)
+	}
+	if resolved != filepath.Clean(path) {
+		return "", fmt.Errorf("git policy must not resolve through symbolic links: %s", path)
+	}
+	if err := sandboxMountPath(resolved); err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+func (plan *sandboxMountPlan) moduleRoots(ctx context.Context, c *Containers, identity sandboxGitIdentity, path string, create bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	exists, err := sandboxOptional(path)
+	if err != nil || !exists {
+		return err
+	}
+	if err := sandboxDirectory(path, false, false); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			if err := plan.moduleRoot(ctx, c, identity, filepath.Join(path, entry.Name()), create); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func sandboxGitPathType(path string, directory bool) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("git metadata must not be a symbolic link: %s", path)
+	}
+	if directory {
+		return info.IsDir(), nil
+	}
+	return info.Mode().IsRegular(), nil
+}
+
+func (plan *sandboxMountPlan) moduleRoot(ctx context.Context, c *Containers, identity sandboxGitIdentity, path string, create bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := sandboxDirectory(path, false, false); err != nil {
+		return err
+	}
+	isRoot, err := sandboxGitPathType(filepath.Join(path, "config"), false)
+	if err != nil {
+		return err
+	}
+	if !isRoot {
+		head, err := sandboxGitPathType(filepath.Join(path, "HEAD"), false)
+		if err != nil {
+			return err
+		}
+		objects, err := sandboxGitPathType(filepath.Join(path, "objects"), true)
+		if err != nil {
+			return err
+		}
+		isRoot = head && objects
+	}
+	if isRoot {
+		if err := plan.bind(path, false); err != nil {
+			return err
+		}
+		for _, name := range []string{"hooks", "info", "objects/info", "modules", "worktrees"} {
+			dir := filepath.Join(path, name)
+			if err := sandboxDirectory(dir, create, false); err != nil {
+				return err
+			}
+			if name != "modules" && name != "worktrees" {
+				if err := plan.policyTree(ctx, dir); err != nil {
+					return err
+				}
+			}
+			if err := plan.bind(dir, true); err != nil {
+				return err
+			}
+		}
+		for _, name := range []string{"config", "config.worktree"} {
+			file := filepath.Join(path, name)
+			if err := sandboxPolicyFile(file, create); err != nil {
+				return err
+			}
+			if err := plan.configSnapshot(ctx, c, identity, file); err != nil {
+				return err
+			}
+		}
+		for _, name := range []string{"gitdir", "commondir"} {
+			file := filepath.Join(path, name)
+			exists, err := sandboxOptional(file)
+			if err != nil {
+				return err
+			}
+			if exists {
+				if _, err := sandboxRegular(file); err != nil {
+					return err
+				}
+				if err := plan.bind(file, true); err != nil {
+					return err
+				}
+			}
+		}
+		return plan.moduleRoots(ctx, c, identity, filepath.Join(path, "modules"), create)
+	}
+	return plan.moduleRoots(ctx, c, identity, path, create)
 }
 
 func (plan *sandboxMountPlan) executablePolicy(ctx context.Context, identity sandboxGitIdentity, config, key, value string) error {
@@ -812,39 +844,32 @@ func (plan *sandboxMountPlan) executablePolicy(ctx context.Context, identity san
 	}
 	token := value
 	if !hooks && key != "core.fsmonitor" {
-		fields := strings.Fields(value)
+		fields := strings.Fields(strings.TrimLeft(value, "!"))
 		if len(fields) == 0 {
 			return nil
 		}
 		token = fields[0]
-		if strings.ContainsAny(token, "'\"!$`%\\;|&<>()") {
-			return fmt.Errorf("sandbox cannot safely protect executable Git config %s in %s", key, config)
-		}
 	}
-	if token == "" || strings.ContainsAny(token, "~$`%\r\n") {
-		return fmt.Errorf("sandbox cannot resolve executable Git policy %s in %s", key, config)
+	token = strings.Trim(token, "'\"")
+	if token == "" || strings.ContainsAny(token, "$`%") {
+		return nil
 	}
 	candidates := []string{token}
 	if !filepath.IsAbs(token) {
-		candidates = []string{filepath.Join(identity.Worktree, token), filepath.Join(filepath.Dir(config), token)}
+		candidates = []string{identity.Worktree + string(filepath.Separator) + token, filepath.Dir(config) + string(filepath.Separator) + token}
 	}
-	found, missing := false, false
 	for _, path := range candidates {
-		path = filepath.Clean(path)
 		exists, err := sandboxOptional(path)
 		if err != nil {
 			return err
 		}
 		if !exists {
-			if hooks {
-				return fmt.Errorf("configured Git hooks directory must exist before sandbox startup: %s", path)
-			}
-			if sandboxWithin(identity.Worktree, path) || sandboxWithin(identity.Common, path) {
-				missing = true
-			}
 			continue
 		}
-		found = true
+		path, err = sandboxResolvePolicy(path)
+		if err != nil {
+			return err
+		}
 		if !sandboxWithin(identity.Worktree, path) && !sandboxWithin(identity.Common, path) {
 			continue
 		}
@@ -861,14 +886,11 @@ func (plan *sandboxMountPlan) executablePolicy(ctx context.Context, identity san
 			break
 		}
 	}
-	if !found && missing && strings.ContainsRune(token, '/') {
-		return fmt.Errorf("configured repository Git program must exist before sandbox startup: %s in %s", token, config)
-	}
 	return nil
 }
 
 func (c *Containers) gitIdentityEnv(ctx context.Context, worktree string) ([]string, error) {
-	output, err := c.Runner.Run(ctx, Process{Name: "git", Args: []string{"-C", worktree, "config", "--null", "--get-regexp", `^user\.(name|email)$`}, Dir: "/", CleanGitEnv: true})
+	output, err := (gitHost{runner: c.Runner}).run(ctx, "/", "-C", worktree, "config", "--null", "--get-regexp", `^user\.(name|email)$`)
 	if err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) && exit.ExitCode() == 1 {

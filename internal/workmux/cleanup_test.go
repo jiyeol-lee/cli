@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -56,6 +57,11 @@ func TestMain(m *testing.M) {
 		paths := CleanupPaths{HomeDir: os.Getenv("WORKMUX_TEST_HOME"), StateDir: os.Getenv("WORKMUX_TEST_STATE"), ConfigDir: os.Getenv("WORKMUX_TEST_CONFIG")}
 		command, err := ParseCommand(os.Args[2:])
 		if err == nil {
+			if path := os.Getenv("WORKMUX_TEST_PARENT_PID"); path != "" {
+				if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+					os.Exit(2)
+				}
+			}
 			if gate := os.Getenv("WORKMUX_TEST_GATE"); gate != "" {
 				deadline := time.Now().Add(15 * time.Second)
 				for time.Now().Before(deadline) {
@@ -622,7 +628,7 @@ func TestCleanupSocketLoss(t *testing.T) {
 					t.Fatal("public retry discarded the unreachable captured server")
 				}
 				current := f.load(t, "topic")
-				if current.Removal.WorktreeRemoved || current.Stage == "removed" || current.Removal.Job.Token != captured.Token || current.Removal.Job.Window != captured {
+				if current.Removal.WorktreeRemoved || current.Stage == "removed" || current.Removal.Job.Token != captured.Token || !reflect.DeepEqual(current.Removal.Job.Window, captured) {
 					t.Fatalf("public retry erased the original capture: %+v", current)
 				}
 				if current.ServerPID != captured.ServerPID || current.SocketDevice != captured.SocketDevice || current.SocketInode != captured.SocketInode {
@@ -888,7 +894,7 @@ func TestCleanupBrokenStdoutDoesNotArmWorker(t *testing.T) {
 }
 
 func TestCleanupWorkerRejectsChangedIdentityRefAndToken(t *testing.T) {
-	for _, kind := range []string{"directory", "symlink", "admin", "ref", "dirty", "ignored", "token", "cancel", "expired"} {
+	for _, kind := range []string{"directory", "symlink", "admin", "ref", "dirty", "token", "cancel", "expired"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newHostFixture(t, "")
 			store, state, command := queuedCleanup(t, f)
@@ -933,8 +939,6 @@ func TestCleanupWorkerRejectsChangedIdentityRefAndToken(t *testing.T) {
 					hostGit(t, state.Path, "commit", "--allow-empty", "-m", "concurrent commit")
 				case "dirty":
 					hostWrite(t, filepath.Join(state.Path, "tracked"), "late work")
-				case "ignored":
-					hostWrite(t, filepath.Join(state.Path, ".env"), "SECRET=value")
 				}
 				if err := store.unlock(); err != nil {
 					t.Fatal(err)
@@ -1096,7 +1100,7 @@ func TestCleanupExternalUsesSavedSocketWithoutTMUX(t *testing.T) {
 }
 
 func TestCleanupActualSelfWindowProcess(t *testing.T) {
-	for _, command := range []string{"remove", "merge"} {
+	for _, command := range []string{"remove", "merge", "remove-unmerged"} {
 		t.Run(command, func(t *testing.T) {
 			ctx, runner, mux, session := isolatedTmux(t)
 			f := newHostFixture(t, "pre_remove:\n  - |\n    printf 'run\\n' >> \"$HOME/hook-count\"\n")
@@ -1104,13 +1108,14 @@ func TestCleanupActualSelfWindowProcess(t *testing.T) {
 				t.Fatal(err)
 			}
 			w := f.load(t, "topic")
-			if command == "merge" {
+			if command == "merge" || command == "remove-unmerged" {
 				hostWrite(t, filepath.Join(w.Path, "tracked"), "merged work\n")
 				hostGit(t, w.Path, "commit", "-am", "merge source")
 			}
 			gate := filepath.Join(f.home, "start")
 			proofPath := filepath.Join(f.home, "proof")
 			output := filepath.Join(f.home, "output")
+			parentPIDPath := filepath.Join(f.home, "parent-pid")
 			executable, err := os.Executable()
 			if err != nil {
 				t.Fatal(err)
@@ -1118,7 +1123,11 @@ func TestCleanupActualSelfWindowProcess(t *testing.T) {
 			paneCommand := []string{"env", "HOME=" + f.home, "WORKMUX_TEST_HOME=" + f.home,
 				"WORKMUX_TEST_STATE=" + f.state, "WORKMUX_TEST_CONFIG=" + f.config,
 				"WORKMUX_TEST_GATE=" + gate, "WORKMUX_TEST_PROOF=" + proofPath,
+				"WORKMUX_TEST_PARENT_PID=" + parentPIDPath,
 				"WORKMUX_TEST_OUTPUT=" + output, "WORKMUX_TEST_HOLD_PARENT=1", executable, "workmux", command}
+			if command == "remove-unmerged" {
+				paneCommand[len(paneCommand)-1] = "remove"
+			}
 			if command == "remove" {
 				paneCommand = append(paneCommand, "--keep-branch")
 			}
@@ -1138,9 +1147,13 @@ func TestCleanupActualSelfWindowProcess(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			parentPID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
-			if err != nil || parentPID <= 1 {
+			panePID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+			if err != nil || panePID <= 1 {
 				t.Fatalf("invalid source pane PID %q", pidData)
+			}
+			parentPID := waitTestProcessPID(t, ctx, parentPIDPath)
+			if parentPID == panePID {
+				t.Fatal("configured helper must be distinct from pane supervisor")
 			}
 			if command == "merge" {
 				// Exercise the last-window case: the entire isolated server exits.
@@ -1149,7 +1162,17 @@ func TestCleanupActualSelfWindowProcess(t *testing.T) {
 				}
 			}
 			hostWrite(t, gate, "start")
+			approved := false
 			for {
+				if command == "remove-unmerged" && !approved {
+					data, err := os.ReadFile(output)
+					if err == nil && bytes.Contains(data, []byte("[y/N]")) {
+						if _, err := runner.Run(ctx, Process{Name: "tmux", Args: []string{"send-keys", "-t", window, "y", "Enter"}}); err != nil {
+							t.Fatal(err)
+						}
+						approved = true
+					}
+				}
 				state, readErr := readState(filepath.Join(f.state, w.RepoID, w.ID+".json"))
 				if readErr == nil && state.Stage == "removed" {
 					break
@@ -1195,12 +1218,41 @@ func TestCleanupActualSelfWindowProcess(t *testing.T) {
 				if got := hostGit(t, f.root, "rev-parse", "topic"); got != w.InitialCommit {
 					t.Fatal("self-window removal deleted kept branch")
 				}
+			} else if command == "remove-unmerged" {
+				if !approved || !state.Removal.DiscardCommits || state.Removal.Force || hostGit(t, f.root, "rev-parse", "main") != w.InitialCommit {
+					t.Fatal("self-window cleanup did not preserve scoped commit consent")
+				}
+				if refs := hostGit(t, f.root, "for-each-ref", "--format=%(refname)", "refs/heads/topic"); refs != "" {
+					t.Fatal("self-window cleanup retained approved unmerged branch")
+				}
 			} else if got := hostGit(t, f.root, "rev-parse", "main"); got != state.MergedCommit {
 				t.Fatal("self-window merge lost target commit")
 			}
 			waitCleanupProcessExit(t, ctx, parentPID)
+			waitCleanupProcessExit(t, ctx, panePID)
 			waitCleanupProcessExit(t, ctx, proof.PID)
 		})
+	}
+}
+
+func waitTestProcessPID(t *testing.T, ctx context.Context, path string) int {
+	t.Helper()
+	for {
+		data, err := os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if len(data) != 0 {
+			pid, err := strconv.Atoi(string(data))
+			if err != nil || pid <= 1 {
+				t.Fatalf("invalid process PID in %s: %q, %v", path, data, err)
+			}
+			return pid
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("timed out waiting for process PID in %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

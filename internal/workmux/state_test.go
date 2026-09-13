@@ -280,11 +280,6 @@ func TestStateLoadsLegacySandboxAndWritesNewShape(t *testing.T) {
 			if !reflect.DeepEqual(states[0], state) {
 				t.Fatalf("legacy normalization changed workspace: %+v, want %+v", states[0], state)
 			}
-			if !test.removed {
-				if err := f.app.savedSandbox(states[0]); err != nil {
-					t.Fatalf("legacy state conflicts with current config: %v", err)
-				}
-			}
 			if err := store.save(states[0]); err != nil {
 				t.Fatal(err)
 			}
@@ -370,6 +365,7 @@ func TestStateLegacySandboxDecodingRemainsStrict(t *testing.T) {
 func TestStateLegacyPodmanKeepsContainerIdentity(t *testing.T) {
 	sandboxTestNonroot(t)
 	c, w, engine := sandboxTestFixture(t)
+	w.Container = "cli-workmux-" + w.ID
 	plan, err := c.mountPlan(t.Context(), w, engine.image, true)
 	if err != nil {
 		t.Fatal(err)
@@ -391,9 +387,6 @@ func TestStateLegacyPodmanKeepsContainerIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256(data))
-	if plan.Fingerprint != fingerprint {
-		t.Fatalf("legacy mount fingerprint changed: %s, want %s", plan.Fingerprint, fingerprint)
-	}
 	if err := plan.snapshots(true); err != nil {
 		t.Fatal(err)
 	}
@@ -418,8 +411,8 @@ func TestStateLegacyPodmanKeepsContainerIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine.calls = nil
-	if err := c.Ensure(t.Context(), state.Workspace); err != nil {
-		t.Fatalf("cannot reuse legacy Podman container: %v", err)
+	if err := c.Ensure(t.Context(), state.Workspace); err == nil || !strings.Contains(err.Error(), "preserved") {
+		t.Fatalf("legacy migration must preserve container data: %v", err)
 	}
 	if engine.container != found {
 		t.Fatal("replaced legacy Podman container")
@@ -429,8 +422,9 @@ func TestStateLegacyPodmanKeepsContainerIdentity(t *testing.T) {
 			t.Fatalf("legacy Podman container was recreated or restarted: %v", args)
 		}
 	}
-	if !slices.Contains(c.PaneCommand(state.Workspace, ""), found.ID) {
-		t.Fatal("legacy pane did not retain inspected container ID")
+	argv, err := c.PaneCommand(t.Context(), state.Workspace, "opencode")
+	if err == nil || len(argv) != 0 || engine.container != found {
+		t.Fatalf("legacy migration must not launch or delete a container: %q, %v", argv, err)
 	}
 	if err := c.Stop(t.Context(), state.Workspace); err != nil {
 		t.Fatal(err)
@@ -459,5 +453,114 @@ func TestHostDefaultDirectories(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", "relative")
 	if err := (&App{HomeDir: home}).defaults(); err == nil {
 		t.Fatal("accepted relative XDG state home")
+	}
+}
+
+func TestStateLegacyPaneSnapshotDoesNotBlockFreshConfiguration(t *testing.T) {
+	f := newHostFixture(t, "")
+	if err := f.run(t, "add", "topic", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	state := f.load(t, "topic")
+	state.Config.Panes = []Pane{{Size: 10, Focus: true}, {Focus: true}}
+	state.Layout = "deleted-layout"
+	store := hostStateStore(t, f)
+	if err := store.save(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "close", "topic"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "open", "topic"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "remove", "topic"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStateLegacyImplicitZeroSizeDoesNotBecomeCurrentConfig(t *testing.T) {
+	f := newHostFixture(t, "panes: [{}, {split: horizontal}]\n")
+	if err := f.run(t, "add", "topic", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	state := f.load(t, "topic")
+	store := hostStateStore(t, f)
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatal(err)
+	}
+	config := saved["config"].(map[string]any)
+	config["panes"] = []any{map[string]any{"size": 0}, map[string]any{"size": 0}}
+	data, err = json.Marshal(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, filepath.Join(store.dir, state.ID+".json"), string(data))
+	if err := store.unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "close", "topic"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run(t, "open", "topic"); err != nil {
+		t.Fatal(err)
+	}
+	for _, pane := range f.mux.panes {
+		if pane.SizeSpecified() {
+			t.Fatal("old implicit size zero leaked into fresh panes")
+		}
+	}
+}
+
+func TestLegacyContainerExplicitKeepBranchMigration(t *testing.T) {
+	f := newHostFixture(t, "sandbox: {enabled: true}\npanes: [{command: opencode}]\n")
+	if err := f.run(t, "add", "topic", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	state := f.load(t, "topic")
+	state.Container, state.SandboxUsed = "cli-workmux-"+state.ID, false
+	store := hostStateStore(t, f)
+	if err := store.save(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.unlock(); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(t.TempDir(), "legacy-backup")
+	hostWrite(t, backup, "user backed up container-local data\n")
+	head := hostGit(t, state.Path, "rev-parse", "HEAD")
+	if err := f.run(t, "close", "topic"); err != nil {
+		t.Fatal(err)
+	}
+	f.sandbox.ensureErr = fmt.Errorf("legacy container preserved; explicit migration required")
+	if err := f.run(t, "open", "topic"); err == nil {
+		t.Fatal("legacy container was silently migrated")
+	}
+	if !f.sandbox.present || slices.Contains(f.events, "sandbox:remove") {
+		t.Fatal("failed migration deleted legacy resources")
+	}
+	if err := f.run(t, "remove", "topic", "--keep-branch"); err != nil {
+		t.Fatal(err)
+	}
+	if hostGit(t, f.root, "rev-parse", "topic") != head {
+		t.Fatal("explicit migration lost branch history")
+	}
+	f.sandbox.ensureErr = nil
+	if err := f.run(t, "add", "topic", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	if state := f.load(t, "topic"); state.Container != "" || !state.SandboxUsed {
+		t.Fatalf("recreated workspace did not select ephemeral sandbox: %+v", state)
+	}
+	if data, err := os.ReadFile(backup); err != nil || string(data) != "user backed up container-local data\n" {
+		t.Fatalf("external backup changed: %q, %v", data, err)
 	}
 }

@@ -5,37 +5,40 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
+	"time"
 )
 
 const sandboxTestInfo = `{"Host":{"DatabaseBackend":"sqlite","Security":{"Rootless":true}},"Store":{"GraphRoot":"/tmp/cli-workmux-engine/store","RunRoot":"/tmp/cli-workmux-engine/run","GraphDriverName":"overlay","ConfigFile":"/tmp/cli-workmux-engine/storage.conf"}}`
 
 type sandboxTestEngine struct {
-	calls      []Process
-	container  *sandboxInspection
-	image      string
-	info       string
-	fail       map[string]error
-	inspection string
-	listing    string
-	home       string
+	calls                                  []Process
+	rawCalls                               []Process
+	container                              *sandboxInspection
+	sessions                               []*sandboxInspection
+	image, info, inspection, listing, home string
+	fail                                   map[string]error
+	disappear                              bool
 }
 
-func sandboxTestEngineArgs(args ...string) []string {
-	return append([]string{"--remote=false"}, args...)
-}
+func sandboxTestCallArgs(call Process) []string { return call.Args }
 
-func sandboxTestCallArgs(call Process) []string {
-	return call.Args[1:]
+func sandboxTestPodmanProcess(p Process) Process {
+	if p.Name == "/usr/bin/env" {
+		if index := slices.Index(p.Args, "podman"); index >= 0 {
+			p.Name, p.Args = "podman", p.Args[index+1:]
+		}
+	}
+	return p
 }
 
 func sandboxTestEndpoint() string {
@@ -44,25 +47,30 @@ func sandboxTestEndpoint() string {
 }
 
 func (engine *sandboxTestEngine) Run(ctx context.Context, p Process) ([]byte, error) {
+	engine.rawCalls = append(engine.rawCalls, p)
+	p = sandboxTestPodmanProcess(p)
 	engine.calls = append(engine.calls, p)
 	if p.Name == "git" {
 		p.Env = append(p.Env, "HOME="+engine.home, "XDG_CONFIG_HOME="+filepath.Join(engine.home, ".config"), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 		return (ExecRunner{}).Run(ctx, p)
 	}
-	if p.Dir != "/" {
-		return nil, fmt.Errorf("engine process must not inherit caller cwd: %q", p.Dir)
+	if p.Name != "podman" || p.Dir != "/" || len(p.Args) == 0 {
+		return nil, fmt.Errorf("unexpected engine process: %+v", p)
 	}
-	prefix := sandboxTestEngineArgs()
-	if p.Name != "podman" || len(p.Args) <= len(prefix) || !slices.Equal(p.Args[:len(prefix)], prefix) {
-		return nil, fmt.Errorf("engine endpoint was not pinned: %s %v", p.Name, p.Args)
-	}
-	p.Args = p.Args[len(prefix):]
 	key := p.Args[0]
 	if key == "container" || key == "image" {
 		key += " " + p.Args[1]
 	}
+	if engine.disappear && (key == "stop" || key == "rm") {
+		engine.sessions = nil
+		return nil, fmt.Errorf("session already removed")
+	}
 	if err := engine.fail[key]; err != nil {
 		return nil, err
+	}
+	all := slices.Clone(engine.sessions)
+	if engine.container != nil {
+		all = append(all, engine.container)
 	}
 	switch key {
 	case "info":
@@ -73,46 +81,54 @@ func (engine *sandboxTestEngine) Run(ctx context.Context, p Process) ([]byte, er
 		if engine.inspection != "" {
 			return []byte(engine.inspection), nil
 		}
-		if engine.container == nil {
-			return nil, fmt.Errorf("no such container")
+		for _, found := range all {
+			if strings.TrimPrefix(found.Name, "/") == p.Args[2] {
+				return json.Marshal([]*sandboxInspection{found})
+			}
 		}
-		return json.Marshal([]*sandboxInspection{engine.container})
+		return nil, fmt.Errorf("no such container")
 	case "container ls":
 		if engine.listing != "" {
 			return []byte(engine.listing), nil
 		}
-		if engine.container == nil {
-			return nil, nil
-		}
-		return []byte(engine.container.Name + "\n"), nil
-	case "create":
-		found := &sandboxInspection{ID: strings.Repeat("a", 64), Image: engine.image}
-		found.Config.Labels = make(map[string]string)
-		for i, arg := range p.Args {
-			switch arg {
-			case "--name":
-				found.Name = "/" + p.Args[i+1]
-			case "--label":
-				key, value, _ := strings.Cut(p.Args[i+1], "=")
-				found.Config.Labels[key] = value
-			case "--entrypoint":
-				found.Config.Image = p.Args[i+2]
+		var names []string
+		for _, found := range all {
+			match := found.State.Running || slices.Contains(p.Args, "--all")
+			for i, arg := range p.Args {
+				if arg != "--filter" {
+					continue
+				}
+				filter := p.Args[i+1]
+				if assignment, ok := strings.CutPrefix(filter, "label="); ok {
+					label, value, _ := strings.Cut(assignment, "=")
+					match = match && found.Config.Labels[label] == value
+				} else if strings.HasPrefix(filter, "name=") {
+					match = match && strings.Contains(filter, strings.TrimPrefix(found.Name, "/"))
+				}
+			}
+			if match {
+				names = append(names, strings.TrimPrefix(found.Name, "/"))
 			}
 		}
-		engine.container = found
-		return []byte(found.ID + "\n"), nil
-	case "start", "stop", "rm":
-		if engine.container == nil || p.Args[len(p.Args)-1] != engine.container.ID {
-			return nil, fmt.Errorf("action must address inspected container ID")
+		return []byte(strings.Join(names, "\n")), nil
+	case "stop", "rm":
+		for _, found := range all {
+			if found.ID != p.Args[len(p.Args)-1] {
+				continue
+			}
+			found.State.Running = false
+			if found == engine.container {
+				if key == "rm" {
+					engine.container = nil
+				}
+			} else {
+				engine.sessions = slices.DeleteFunc(engine.sessions, func(candidate *sandboxInspection) bool { return candidate == found })
+			}
+			return nil, nil
 		}
-		if key == "rm" {
-			engine.container = nil
-		} else {
-			engine.container.State.Running = key == "start"
-		}
-		return nil, nil
-	case "exec":
-		if p.Stdout != nil && p.Stdin != nil {
+		return nil, fmt.Errorf("action must address inspected container ID")
+	case "run":
+		if p.Stdin != nil && p.Stdout != nil {
 			_, err := io.Copy(p.Stdout, p.Stdin)
 			return nil, err
 		}
@@ -124,10 +140,7 @@ func (engine *sandboxTestEngine) Run(ctx context.Context, p Process) ([]byte, er
 
 func sandboxTestGit(t *testing.T, dir string, args ...string) []byte {
 	t.Helper()
-	out, err := (ExecRunner{}).Run(context.Background(), Process{
-		Name: "git", Args: args, Dir: dir, CleanGitEnv: true,
-		Env: []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0"},
-	})
+	out, err := (ExecRunner{}).Run(t.Context(), Process{Name: "git", Args: args, Dir: dir, CleanGitEnv: true, Env: []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0"}})
 	if err != nil {
 		t.Fatalf("git %v: %v", args, err)
 	}
@@ -147,9 +160,7 @@ func sandboxTestWrite(t *testing.T, path, value string) {
 func sandboxTestFixture(t *testing.T) (*Containers, Workspace, *sandboxTestEngine) {
 	t.Helper()
 	base := t.TempDir()
-	root := filepath.Join(base, "main")
-	worktree := filepath.Join(base, "linked worktree")
-	home := filepath.Join(base, "fake-home")
+	root, worktree, home := filepath.Join(base, "main"), filepath.Join(base, "linked worktree"), filepath.Join(base, "fake-home")
 	for _, dir := range []string{root, home} {
 		if err := os.Mkdir(dir, 0700); err != nil {
 			t.Fatal(err)
@@ -165,11 +176,7 @@ func sandboxTestFixture(t *testing.T) (*Containers, Workspace, *sandboxTestEngin
 	sandboxTestGit(t, root, "worktree", "add", "-qb", "topic", worktree)
 	engine := &sandboxTestEngine{image: "sha256:" + strings.Repeat("b", 64), info: sandboxTestInfo, fail: make(map[string]error), home: home}
 	c := &Containers{Runner: engine, HomeDir: home, StateDir: filepath.Join(base, "private-state"), Getenv: func(string) string { return "" }}
-	w := Workspace{
-		ID: "sandbox-test", RepoID: "repository-test", Root: root, CommonDir: filepath.Join(root, ".git"),
-		Path: worktree, Branch: "topic", Handle: "topic", Container: "cli-workmux-test", Stage: "ready",
-		Config: Config{Sandbox: SandboxConfig{Enabled: true, Image: "localhost/cli-workmux:test"}},
-	}
+	w := Workspace{ID: identity(filepath.Join(root, ".git"), worktree), RepoID: identity(filepath.Join(root, ".git")), Root: root, CommonDir: filepath.Join(root, ".git"), Path: worktree, Branch: "topic", Handle: "topic", Stage: "ready", Config: Config{Sandbox: SandboxConfig{Enabled: true, Image: "localhost/cli-workmux:test"}}}
 	return c, w, engine
 }
 
@@ -186,575 +193,334 @@ func sandboxEngineCalls(engine *sandboxTestEngine) []Process {
 func sandboxTestNonroot(t *testing.T) {
 	t.Helper()
 	if os.Getuid() == 0 || os.Getgid() == 0 {
-		t.Skip("container lifecycle requires a nonroot host UID:GID")
+		t.Skip("integration fixture requires a nonroot host UID:GID")
 	}
 }
 
+func sandboxTestSession(t *testing.T, engine *sandboxTestEngine, argv []string) *sandboxInspection {
+	t.Helper()
+	found := &sandboxInspection{ID: fmt.Sprintf("%064x", len(engine.sessions)+1), Image: engine.image}
+	found.State.Running = true
+	found.Config.Labels = make(map[string]string)
+	for i, arg := range argv {
+		switch arg {
+		case "--name":
+			found.Name = argv[i+1]
+		case "--label":
+			key, value, _ := strings.Cut(argv[i+1], "=")
+			found.Config.Labels[key] = value
+		}
+	}
+	engine.sessions = append(engine.sessions, found)
+	return found
+}
+
+func sandboxTestLegacy(t *testing.T, c *Containers, w *Workspace, engine *sandboxTestEngine) *sandboxInspection {
+	t.Helper()
+	w.Container = "cli-workmux-legacy-test"
+	found := &sandboxInspection{ID: strings.Repeat("a", 64), Name: w.Container, Image: engine.image}
+	found.State.Running = true
+	found.Config.Image = w.Config.Sandbox.Image
+	found.Config.Labels = make(map[string]string)
+	for key, value := range map[string]string{"owner": "cli-workmux", "policy": "2", "workspace": w.ID, "repository": w.RepoID, "root": w.Root, "common": w.CommonDir, "path": w.Path, "runtime": "podman", "image": w.Config.Sandbox.Image, "image-id": engine.image, "mounts": strings.Repeat("c", 64), "endpoint": sandboxTestEndpoint()} {
+		found.Config.Labels[sandboxLabel+key] = value
+	}
+	engine.container = found
+	if err := c.endpoint(*w, sandboxEngine{Endpoint: sandboxTestEndpoint()}, true); err != nil {
+		t.Fatal(err)
+	}
+	return found
+}
+
 func TestContainersCheck(t *testing.T) {
-	sandboxTestNonroot(t)
 	for _, test := range []struct {
-		name, info, failure string
-		disabled            bool
-		wantErr             bool
+		name, failure, image string
+		disabled, wantErr    bool
 	}{
-		{name: "local rootless podman"},
-		{name: "disabled", disabled: true},
-		{name: "engine failure", failure: "info", wantErr: true},
-		{name: "image missing", failure: "image inspect", wantErr: true},
-		{name: "malformed info", info: "broken", wantErr: true},
-		{name: "remote podman", info: `{"host":{"serviceIsRemote":true}}`, wantErr: true},
-		{name: "rootful podman", info: strings.Replace(sandboxTestInfo, `"Rootless":true`, `"Rootless":false`, 1), wantErr: true},
-		{name: "missing driver", info: strings.Replace(sandboxTestInfo, `"overlay"`, `""`, 1), wantErr: true},
-		{name: "relative storage", info: strings.Replace(sandboxTestInfo, `"/tmp/cli-workmux-engine/store"`, `"relative"`, 1), wantErr: true},
-		{name: "missing storage identity", info: `{"Host":{"Security":{"Rootless":true}}}`, wantErr: true},
+		{name: "Podman"}, {name: "disabled", disabled: true},
+		{name: "missing custom image", failure: "image inspect", wantErr: true},
+		{name: "bad image identity", image: "sha256:short", wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			engine := &sandboxTestEngine{image: "sha256:" + strings.Repeat("b", 64), info: sandboxTestInfo, fail: make(map[string]error)}
-			if test.info != "" {
-				engine.info = test.info
+			c, w, engine := sandboxTestFixture(t)
+			if test.image != "" {
+				engine.image = test.image
 			}
 			if test.failure != "" {
 				engine.fail[test.failure] = fmt.Errorf("unavailable")
 			}
-			home := t.TempDir()
-			sandboxTestWrite(t, filepath.Join(home, ".config", "opencode", ".gitignore"), "")
-			c := &Containers{Runner: engine, HomeDir: home, Getenv: func(string) string { return "" }}
-			config := SandboxConfig{Enabled: !test.disabled, Image: "localhost/test:local"}
-			err := c.Check(context.Background(), config)
-			if (err != nil) != test.wantErr {
-				t.Fatalf("Check error = %v", err)
+			w.Config.Sandbox.Enabled = !test.disabled
+			if err := c.Check(t.Context(), w.Config.Sandbox); (err != nil) != test.wantErr {
+				t.Fatalf("Check = %v", err)
 			}
 			if test.disabled && len(engine.calls) != 0 {
 				t.Fatal("disabled sandbox invoked engine")
 			}
 			for _, call := range engine.calls {
-				if call.Name != "podman" || !call.CleanGitEnv || call.Dir != "/" {
-					t.Fatalf("unexpected process: %+v", call)
-				}
-				if !slices.Equal(call.Args, sandboxTestEngineArgs("info", "--format", "{{json .}}")) && !slices.Equal(call.Args, sandboxTestEngineArgs("image", "inspect", config.Image)) {
-					t.Fatalf("unexpected check args: %v", call.Args)
+				if !slices.Equal(call.Args, []string{"image", "inspect", w.Config.Sandbox.Image}) {
+					t.Fatalf("unexpected check: %+v", call)
 				}
 			}
 		})
 	}
 }
 
-func TestContainersLifecycle(t *testing.T) {
-	sandboxTestNonroot(t)
+func TestContainersEphemeralPane(t *testing.T) {
 	c, w, engine := sandboxTestFixture(t)
-	plan, err := c.mountPlan(context.Background(), w, engine.image, true)
+	if err := c.Ensure(t.Context(), w); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(c.StateDir); !os.IsNotExist(err) {
+		t.Fatalf("preflight prepared mounts: %v", err)
+	}
+	command := `opencode "quoted arg"; printf '%s' '$literal'`
+	first, err := c.PaneCommand(t.Context(), w, command)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Ensure(context.Background(), w); err != nil {
+	second, err := c.PaneCommand(t.Context(), w, command)
+	if err != nil {
 		t.Fatal(err)
 	}
-	calls := sandboxEngineCalls(engine)
-	expected := [][]string{
-		{"info", "--format", "{{json .}}"}, {"image", "inspect", w.Config.Sandbox.Image},
-		{"info", "--format", "{{json .}}"},
-		{"container", "inspect", w.Container}, {"container", "ls", "--all", "--filter", "name=^/?cli-workmux-test$", "--format", "{{.Names}}"},
-		nil, {"container", "inspect", w.Container}, {"start", engine.container.ID},
-	}
-	createIndex := 5
-	if len(calls) != len(expected) {
-		t.Fatalf("engine calls = %+v", calls)
-	}
-	for i, call := range calls {
-		want := sandboxTestEngineArgs(expected[i]...)
-		if call.Name != "podman" || i != createIndex && !slices.Equal(call.Args, want) {
-			t.Fatalf("call %d = %s %v, want %v", i, call.Name, call.Args, expected[i])
+	for _, argv := range [][]string{first, second} {
+		process := sandboxTestPodmanProcess(Process{Name: argv[0], Args: argv[1:]})
+		if argv[0] != "/usr/bin/env" || process.Name != "podman" || !slices.Equal(process.Args[:3], []string{"run", "--rm", "-it"}) || !slices.Equal(argv[len(argv)-4:], []string{engine.image, "sh", "-c", command}) {
+			t.Fatalf("pane argv = %q", argv)
 		}
-	}
-	wantCreate := []string{"create", "--name", w.Container, "--pull=never", "--init", "--user", strconv.Itoa(os.Getuid()) + ":" + strconv.Itoa(os.Getgid()), "--cap-drop=ALL", "--security-opt=no-new-privileges", "--userns=keep-id"}
-	labels := map[string]string{
-		"common": w.CommonDir, "image": w.Config.Sandbox.Image, "image-id": engine.image, "mounts": plan.Fingerprint,
-		"owner": "cli-workmux", "path": w.Path, "policy": "2", "repository": w.RepoID, "root": w.Root, "runtime": "podman", "workspace": w.ID,
-		"endpoint": sandboxTestEndpoint(),
-	}
-	for _, key := range []string{"common", "endpoint", "image", "image-id", "mounts", "owner", "path", "policy", "repository", "root", "runtime", "workspace"} {
-		wantCreate = append(wantCreate, "--label", sandboxLabel+key+"="+labels[key])
-	}
-	for _, mount := range plan.Mounts {
-		value := "type=bind,source=" + mount.Source + ",target=" + mount.Target
-		if mount.ReadOnly {
-			value += ",readonly"
-		}
-		wantCreate = append(wantCreate, "--mount", value)
-	}
-	wantCreate = append(wantCreate, "--workdir", w.Path)
-	for _, entry := range plan.Env {
-		wantCreate = append(wantCreate, "--env", entry)
-	}
-	wantCreate = append(wantCreate, "--entrypoint", "/usr/bin/sleep", engine.image, "infinity")
-	wantCreate = sandboxTestEngineArgs(wantCreate...)
-	if !slices.Equal(calls[createIndex].Args, wantCreate) {
-		t.Fatalf("create args\ngot  %q\nwant %q", calls[createIndex].Args, wantCreate)
-	}
-	engine.calls = nil
-	if err := c.Ensure(context.Background(), w); err != nil {
-		t.Fatal(err)
-	}
-	if calls := sandboxEngineCalls(engine); len(calls) != 4 {
-		t.Fatalf("reuse must not create or start: %+v", calls)
-	}
-	id := engine.container.ID
-	for _, action := range []struct {
-		run  func(context.Context, Workspace) error
-		args []string
-	}{{c.Stop, []string{"stop", id}}, {c.Stop, nil}, {c.Ensure, []string{"start", id}}, {c.Remove, []string{"rm", "--force", id}}, {c.Remove, nil}, {c.Stop, nil}} {
-		engine.calls = nil
-		if err := action.run(context.Background(), w); err != nil {
-			t.Fatal(err)
-		}
-		var mutations [][]string
-		for _, call := range sandboxEngineCalls(engine) {
-			args := sandboxTestCallArgs(call)
-			if slices.Contains([]string{"start", "stop", "rm", "create"}, args[0]) {
-				mutations = append(mutations, args)
+		for _, part := range [][]string{{"--userns=keep-id"}, {"--user", strconv.Itoa(os.Getuid()) + ":" + strconv.Itoa(os.Getgid())}, {"--workdir", w.Path}} {
+			i := slices.Index(argv, part[0])
+			if i < 0 || !slices.Equal(argv[i:i+len(part)], part) {
+				t.Fatalf("missing %q in %q", part, argv)
 			}
 		}
-		if action.args == nil && len(mutations) != 0 || action.args != nil && (len(mutations) != 1 || !slices.Equal(mutations[0], action.args)) {
-			t.Fatalf("action args = %v, want %v", mutations, action.args)
+	}
+	if first[slices.Index(first, "--name")+1] == second[slices.Index(second, "--name")+1] {
+		t.Fatal("panes share a container name")
+	}
+	for _, call := range sandboxEngineCalls(engine) {
+		if call.Args[0] != "image" {
+			t.Fatalf("preparing a pane started a persistent container: %+v", call)
 		}
+	}
+	// A new pane takes a fresh snapshot rather than freezing the first pane's config.
+	sandboxTestGit(t, w.Root, "config", "user.name", "Changed")
+	if _, err := c.PaneCommand(t.Context(), w, command); err != nil {
+		t.Fatalf("new pane rejected changed config: %v", err)
 	}
 }
 
-func TestContainersMissingVersusUnavailable(t *testing.T) {
-	sandboxTestNonroot(t)
-	for _, test := range []struct {
-		name, inspection, listing string
-		inspectFail, listFail     bool
-		wantErr                   bool
-	}{
-		{name: "missing"},
-		{name: "engine unavailable", inspectFail: true, listFail: true, wantErr: true},
-		{name: "inspect failed but name exists", inspectFail: true, listing: "cli-workmux-test\n", wantErr: true},
-		{name: "invalid json", inspection: "not json", wantErr: true},
-		{name: "empty inspect json", inspection: "[]", wantErr: true},
-		{name: "wrong name", inspection: `[{"Id":"abc","Name":"another"}]`, wantErr: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			c, w, engine := sandboxTestFixture(t)
-			engine.inspection, engine.listing = test.inspection, test.listing
-			if test.inspectFail {
-				engine.fail["container inspect"] = fmt.Errorf("engine connection refused")
-			}
-			if test.listFail {
-				engine.fail["container ls"] = fmt.Errorf("engine connection refused")
-			}
-			for _, action := range []func(context.Context, Workspace) error{c.Stop, c.Remove} {
-				if err := action(context.Background(), w); (err != nil) != test.wantErr {
-					t.Fatalf("action error = %v", err)
-				}
-			}
-		})
-	}
-}
-
-func TestContainersRefuseForeignLabels(t *testing.T) {
-	sandboxTestNonroot(t)
-	c, w, engine := sandboxTestFixture(t)
-	if err := c.Ensure(context.Background(), w); err != nil {
-		t.Fatal(err)
-	}
-	for key, value := range engine.container.Config.Labels {
-		t.Run(key, func(t *testing.T) {
-			engine.container.Config.Labels[key] = "foreign"
-			defer func() { engine.container.Config.Labels[key] = value }()
-			engine.calls = nil
-			for _, action := range []func(context.Context, Workspace) error{c.Ensure, c.Stop, c.Remove} {
-				if err := action(context.Background(), w); err == nil {
-					t.Fatal("foreign ownership accepted")
-				}
-			}
-			if err := c.Exec(context.Background(), w, "opencode", nil, nil, nil, nil); err == nil {
-				t.Fatal("foreign exec accepted")
-			}
-			if got := c.PaneCommand(w, "opencode"); !slices.Equal(got, []string{"/usr/bin/false"}) {
-				t.Fatalf("foreign pane command accepted: %v", got)
-			}
-			for _, call := range sandboxEngineCalls(engine) {
-				if slices.Contains([]string{"start", "stop", "rm", "create", "exec"}, sandboxTestCallArgs(call)[0]) {
-					t.Fatalf("acted on foreign container: %v", call.Args)
-				}
-			}
-		})
-	}
-}
-
-func TestContainersRefuseStaleProtection(t *testing.T) {
-	sandboxTestNonroot(t)
-	for _, change := range []string{"config contents", "config inode", "image", "new credential directory", "missing snapshot", "snapshot contents"} {
+func TestContainersPrepareFailsClosed(t *testing.T) {
+	for _, change := range []string{"image", "pointer", "disabled", "legacy", "canceled", "command"} {
 		t.Run(change, func(t *testing.T) {
 			c, w, engine := sandboxTestFixture(t)
-			if err := c.Ensure(context.Background(), w); err != nil {
-				t.Fatal(err)
-			}
-			plan, err := c.mountPlan(context.Background(), w, engine.image, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var snapshot string
-			for _, mount := range plan.Mounts {
-				if mount.Snapshot {
-					snapshot = mount.Source
-					break
-				}
-			}
-			original, err := os.ReadFile(snapshot)
-			if err != nil {
-				t.Fatal(err)
-			}
-			config := filepath.Join(w.CommonDir, "config")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			command := "opencode"
 			switch change {
-			case "config contents":
-				sandboxTestGit(t, w.Root, "config", "user.name", "Changed Name")
-			case "config inode":
-				data, err := os.ReadFile(config)
-				if err != nil {
-					t.Fatal(err)
-				}
-				sandboxTestWrite(t, config+".replacement", string(data))
-				if err := os.Rename(config+".replacement", config); err != nil {
-					t.Fatal(err)
-				}
 			case "image":
-				engine.image = "sha256:" + strings.Repeat("c", 64)
-			case "new credential directory":
-				data := filepath.Join(c.HomeDir, "new-data")
-				if err := os.MkdirAll(filepath.Join(data, "opencode"), 0700); err != nil {
-					t.Fatal(err)
-				}
-				c.Getenv = func(key string) string {
-					if key == "XDG_DATA_HOME" {
-						return data
-					}
-					return ""
-				}
-			case "missing snapshot":
-				if err := os.Remove(snapshot); err != nil {
-					t.Fatal(err)
-				}
-			case "snapshot contents":
-				sandboxTestWrite(t, snapshot, "changed snapshot")
+				engine.fail["image inspect"] = fmt.Errorf("missing image")
+			case "pointer":
+				sandboxTestWrite(t, filepath.Join(w.Path, ".git"), "invalid")
+			case "disabled":
+				w.Config.Sandbox.Enabled = false
+			case "legacy":
+				w.Container = "legacy"
+			case "canceled":
+				cancel()
+			case "command":
+				command += "\x00"
 			}
-			engine.calls = nil
-			if err := c.Ensure(context.Background(), w); err == nil {
-				t.Fatal("stale sandbox was reused")
-			}
-			for _, call := range sandboxEngineCalls(engine) {
-				if args := sandboxTestCallArgs(call); args[0] == "create" || args[0] == "start" {
-					t.Fatalf("stale sandbox silently restarted: %v", call.Args)
-				}
-			}
-			if change != "missing snapshot" && change != "snapshot contents" {
-				now, err := os.ReadFile(snapshot)
-				if err != nil || !bytes.Equal(now, original) {
-					t.Fatalf("running snapshot was modified: %v", err)
-				}
-			}
-			if err := c.Remove(context.Background(), w); err != nil {
-				t.Fatalf("cannot remove stale but owned container: %v", err)
+			argv, err := c.PaneCommand(ctx, w, command)
+			if err == nil || len(argv) != 0 {
+				t.Fatalf("prepare returned host-executable fallback: %q, %v", argv, err)
 			}
 		})
 	}
 }
 
-func TestContainersExecAndPaneArguments(t *testing.T) {
-	sandboxTestNonroot(t)
+func TestContainersExecFinite(t *testing.T) {
 	c, w, engine := sandboxTestFixture(t)
-	command := `opencode "quoted arg"; printf '%s' '$literal'`
 	var stdout, stderr bytes.Buffer
 	stdin := strings.NewReader("input")
 	env := []string{"WM_BRANCH=topic $(false)", "VALUE=one=two\nthree", "_NUMBER1=1"}
-	if err := c.Exec(context.Background(), w, command, env, stdin, &stdout, &stderr); err != nil {
+	if err := c.Exec(t.Context(), w, "exit 7", env, stdin, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 	last := engine.calls[len(engine.calls)-1]
-	want := sandboxTestEngineArgs("exec", "-i", "--workdir", w.Path, "--env", env[0], "--env", env[1], "--env", env[2], engine.container.ID, "bash", "-c", command)
-	if !slices.Equal(last.Args, want) || last.Stdin != stdin || last.Stdout != &stdout || last.Stderr != &stderr || stdout.String() != "input" {
-		t.Fatalf("exec process = %+v; want %v", last, want)
+	if !slices.Equal(last.Args[:3], []string{"run", "--rm", "-i"}) || !slices.Equal(last.Args[len(last.Args)-3:], []string{"sh", "-c", "exit 7"}) || last.Stdin != stdin || last.Stdout != &stdout || last.Stderr != &stderr || stdout.String() != "input" {
+		t.Fatalf("Exec process = %+v", last)
 	}
-	if err := c.Exec(context.Background(), w, "opencode", nil, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	last = engine.calls[len(engine.calls)-1]
-	want = sandboxTestEngineArgs("exec", "--workdir", w.Path, engine.container.ID, "bash", "-c", "opencode")
-	if !slices.Equal(last.Args, want) {
-		t.Fatalf("noninteractive exec = %v", last.Args)
-	}
-	for _, command := range []string{"", "opencode", `printf '%s' 'a b'`} {
-		want := []string{"/usr/bin/env", "--chdir=/"}
-		for _, key := range sandboxEngineEnvKeys {
-			want = append(want, "--unset="+key)
-		}
-		for _, key := range sandboxEngineEnvKeys {
-			if value := os.Getenv(key); value != "" {
-				want = append(want, key+"="+value)
-			}
-		}
-		want = append(want, "podman", "--remote=false", "exec", "-it", "--workdir", w.Path, engine.container.ID, "bash")
-		if command == "" {
-			want = append(want, "-i")
-		} else {
-			want = append(want, "-c", command)
-		}
-		if got := c.PaneCommand(w, command); !reflect.DeepEqual(got, want) {
-			t.Fatalf("pane command = %v, want %v", got, want)
+	for _, entry := range env {
+		if !slices.Contains(last.Args, entry) {
+			t.Fatalf("missing environment %q", entry)
 		}
 	}
-	for _, env := range []string{"SECRET", "=empty", "--privileged=1", "1KEY=value", "A-B=value", "A\nB=value", "A=value\x00"} {
+	failure := fmt.Errorf("finite process failed")
+	engine.fail["run"] = failure
+	if err := c.Exec(t.Context(), w, "false", nil, nil, nil, nil); !errors.Is(err, failure) {
+		t.Fatalf("lost underlying status: %v", err)
+	}
+	for _, entry := range []string{"SECRET", "=empty", "--privileged=1", "1KEY=value", "A-B=value", "A\nB=value", "A=value\x00"} {
 		engine.calls = nil
-		if err := c.Exec(context.Background(), w, "opencode", []string{env}, nil, nil, nil); err == nil || len(engine.calls) != 0 {
-			t.Fatalf("invalid env accepted or engine invoked: %q", env)
+		if err := c.Exec(t.Context(), w, "opencode", []string{entry}, nil, nil, nil); err == nil || len(engine.calls) != 0 {
+			t.Fatalf("invalid env accepted: %q", entry)
 		}
 	}
 }
 
-func TestContainersActionFailure(t *testing.T) {
-	sandboxTestNonroot(t)
-	for _, failure := range []string{"create", "start", "stop", "rm", "exec"} {
-		t.Run(failure, func(t *testing.T) {
-			c, w, engine := sandboxTestFixture(t)
-			if failure != "create" && failure != "start" {
-				if err := c.Ensure(context.Background(), w); err != nil {
-					t.Fatal(err)
+func TestContainersConfiguredPodmanRouting(t *testing.T) {
+	c, w, engine := sandboxTestFixture(t)
+	for _, key := range []string{"CONTAINER_HOST", "CONTAINER_CONNECTION", "CONTAINER_SSHKEY", "PODMAN_CONNECTIONS_CONF", "CONTAINERS_CONF", "CONTAINERS_CONF_OVERRIDE", "CONTAINERS_STORAGE_CONF", "STORAGE_DRIVER", "STORAGE_OPTS", "DOCKER_HOST"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "user-selected-routing")
+			if err := c.Ensure(t.Context(), w); err != nil {
+				t.Fatal(err)
+			}
+			argv, err := c.PaneCommand(t.Context(), w, "opencode")
+			if err != nil || argv[0] != "/usr/bin/env" || !slices.Contains(argv, "podman") || slices.Contains(argv, "--remote=false") {
+				t.Fatalf("routing refused or overridden: %q %v", argv, err)
+			}
+			for _, call := range sandboxEngineCalls(engine) {
+				if call.Name != "podman" || len(call.Env) != 0 {
+					t.Fatalf("runtime environment overridden: %+v", call)
 				}
 			}
-			engine.fail[failure] = fmt.Errorf("engine unavailable")
-			action := c.Ensure
-			switch failure {
-			case "stop":
-				action = c.Stop
-			case "rm":
-				action = c.Remove
-			case "exec":
-				action = func(ctx context.Context, w Workspace) error { return c.Exec(ctx, w, "opencode", nil, nil, nil, nil) }
-			}
-			if err := action(context.Background(), w); err == nil || !strings.Contains(err.Error(), "engine unavailable") {
-				t.Fatalf("action failure = %v", err)
+			last := engine.rawCalls[0]
+			if last.Name != "/usr/bin/env" || !slices.Contains(last.Args, "podman") {
+				t.Fatalf("preflight did not use structured environment prefix: %+v", last)
 			}
 		})
 	}
 }
 
-func TestContainersCleanupWithoutWorktree(t *testing.T) {
-	sandboxTestNonroot(t)
-	c, w, _ := sandboxTestFixture(t)
-	if err := c.Ensure(context.Background(), w); err != nil {
-		t.Fatal(err)
+func TestContainersOwnedSessions(t *testing.T) {
+	c, w, engine := sandboxTestFixture(t)
+	for range 2 {
+		argv, err := c.PaneCommand(t.Context(), w, "opencode")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sandboxTestSession(t, engine, argv)
+	}
+	foreign := *engine.sessions[0]
+	foreign.ID, foreign.Name = "foreign", "unrelated"
+	foreign.Config.Labels = map[string]string{sandboxLabel + "owner": "somebody-else"}
+	engine.sessions = append(engine.sessions, &foreign)
+	if present, err := c.Exists(t.Context(), w); err != nil || !present {
+		t.Fatalf("Exists = %v, %v", present, err)
 	}
 	if err := os.RemoveAll(w.Path); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.RemoveAll(w.Root); err != nil {
+	if err := c.Stop(t.Context(), w); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Stop(context.Background(), w); err != nil {
-		t.Fatal(err)
+	if len(engine.sessions) != 1 || engine.sessions[0] != &foreign || !foreign.State.Running {
+		t.Fatal("stop did not remove only both owned sessions")
 	}
-	if err := c.Remove(context.Background(), w); err != nil {
-		t.Fatal(err)
-	}
-	if got := c.PaneCommand(w, ""); !slices.Equal(got, []string{"/usr/bin/false"}) {
-		t.Fatalf("missing container could start a host shell: %v", got)
-	}
-}
-
-func TestContainersRejectInvalidImageIdentity(t *testing.T) {
-	sandboxTestNonroot(t)
-	for _, image := range []string{"", "--privileged", "sha256:short", strings.Repeat("b", 64) + "\n"} {
-		engine := &sandboxTestEngine{image: image, info: sandboxTestInfo}
-		home := t.TempDir()
-		sandboxTestWrite(t, filepath.Join(home, ".config", "opencode", ".gitignore"), "")
-		c := &Containers{Runner: engine, HomeDir: home, Getenv: func(string) string { return "" }}
-		if err := c.Check(context.Background(), SandboxConfig{Enabled: true, Image: "localhost/test:local"}); err == nil {
-			t.Fatalf("invalid image identity accepted: %q", image)
+	stops := 0
+	for _, call := range engine.calls {
+		if call.Name == "podman" && len(call.Args) > 0 && call.Args[0] == "stop" {
+			stops++
+			if len(call.Args) != 4 || !slices.Equal(call.Args[:3], []string{"stop", "-t", "0"}) {
+				t.Fatalf("sandbox stop must use upstream's zero-second timeout: %v", call.Args)
+			}
 		}
 	}
-}
-
-func TestContainersRejectEndpointOverridesOnEveryAction(t *testing.T) {
-	sandboxTestNonroot(t)
-	c, w, engine := sandboxTestFixture(t)
-	if err := c.Ensure(context.Background(), w); err != nil {
+	if stops != 2 {
+		t.Fatalf("stopped %d sessions, want 2", stops)
+	}
+	if present, err := c.Exists(t.Context(), w); err != nil || present {
+		t.Fatalf("Exists after --rm = %v, %v", present, err)
+	}
+	if err := c.Remove(t.Context(), w); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"CONTAINER_HOST", "CONTAINER_CONNECTION", "CONTAINER_SSHKEY", "PODMAN_CONNECTIONS_CONF", "CONTAINERS_CONF", "CONTAINERS_CONF_OVERRIDE", "CONTAINERS_STORAGE_CONF", "STORAGE_DRIVER", "STORAGE_OPTS"} {
+}
+
+func TestContainersValidateEveryOwnershipLabel(t *testing.T) {
+	c, w, engine := sandboxTestFixture(t)
+	argv, err := c.PaneCommand(t.Context(), w, "opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := sandboxTestSession(t, engine, argv)
+	engine.listing = found.Name
+	for key, value := range found.Config.Labels {
+		if key == sandboxLabel+"image" {
+			continue
+		}
 		t.Run(key, func(t *testing.T) {
-			c.Getenv = func(name string) string {
-				if name == key {
-					return "different-engine"
-				}
-				return ""
-			}
-			for _, action := range []func(context.Context, Workspace) error{c.Ensure, c.Stop, c.Remove} {
-				engine.calls = nil
-				if err := action(context.Background(), w); err == nil || !strings.Contains(err.Error(), key) || len(engine.calls) != 0 {
-					t.Fatalf("override reached an engine or was treated as absent: %v, calls=%v", err, engine.calls)
-				}
-			}
-			if err := c.Exec(context.Background(), w, "opencode", nil, nil, nil, nil); err == nil {
-				t.Fatal("exec accepted endpoint override")
-			}
-			if args := c.PaneCommand(w, "opencode"); !slices.Equal(args, []string{"/usr/bin/false"}) || len(engine.calls) != 0 {
-				t.Fatalf("pane accepted endpoint override: %v", args)
-			}
-			if engine.container == nil || !engine.container.State.Running {
-				t.Fatal("endpoint rejection modified the original container")
-			}
-			if _, err := os.Stat(w.Path); err != nil {
-				t.Fatal("endpoint rejection removed worktree", err)
-			}
-		})
-	}
-}
-
-func TestContainersRejectChangedEndpointBeforeMissingLookup(t *testing.T) {
-	sandboxTestNonroot(t)
-	for _, change := range []struct{ old, new string }{
-		{"/tmp/cli-workmux-engine/store", "/tmp/different-engine/store"},
-		{"/tmp/cli-workmux-engine/run", "/tmp/different-engine/run"},
-		{"overlay", "vfs"},
-		{"/tmp/cli-workmux-engine/storage.conf", "/tmp/different-engine/storage.conf"},
-		{"sqlite", "boltdb"},
-		{`"Store":{`, `"Store":{"TransientStore":true,`},
-	} {
-		t.Run(change.old, func(t *testing.T) {
-			c, w, engine := sandboxTestFixture(t)
-			if err := c.Ensure(context.Background(), w); err != nil {
-				t.Fatal(err)
-			}
-			engine.info = strings.Replace(engine.info, change.old, change.new, 1)
-			engine.container = nil
-			for _, action := range []func(context.Context, Workspace) error{c.Stop, c.Remove} {
-				engine.calls = nil
-				if err := action(context.Background(), w); err == nil || !strings.Contains(err.Error(), "engine identity changed") {
-					t.Fatalf("different endpoint treated as missing: %v", err)
-				}
-				for _, call := range sandboxEngineCalls(engine) {
-					if args := sandboxTestCallArgs(call); args[0] != "info" {
-						t.Fatalf("queried container in a different endpoint: %v", call.Args)
-					}
-				}
-			}
-		})
-	}
-}
-
-func TestContainersIgnoreDockerEnvironment(t *testing.T) {
-	sandboxTestNonroot(t)
-	for _, value := range []string{"", "unrelated-docker-setting"} {
-		t.Run(value, func(t *testing.T) {
-			for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"} {
-				t.Setenv(key, value)
-			}
-			c, w, engine := sandboxTestFixture(t)
-			c.Getenv = func(key string) string {
-				if strings.HasPrefix(key, "DOCKER_") {
-					return value
-				}
-				return ""
-			}
-			if err := c.Check(t.Context(), w.Config.Sandbox); err != nil {
-				t.Fatal(err)
-			}
-			if err := c.Exec(t.Context(), w, "opencode", nil, nil, nil, nil); err != nil {
-				t.Fatal(err)
-			}
-			pane := c.PaneCommand(w, "")
-			if !slices.Contains(pane, "podman") || !slices.Contains(pane, "--remote=false") {
-				t.Fatalf("pane did not use local Podman: %v", pane)
-			}
-			for _, arg := range pane {
-				if strings.Contains(arg, "DOCKER_") {
-					t.Fatalf("pane manages unrelated Docker settings: %v", pane)
-				}
-			}
-			for _, action := range []func(context.Context, Workspace) error{c.Ensure, c.Stop, c.Remove} {
-				if err := action(t.Context(), w); err != nil {
-					t.Fatal(err)
-				}
-			}
-			for _, call := range sandboxEngineCalls(engine) {
-				if call.Name != "podman" || call.Args[0] != "--remote=false" {
-					t.Fatalf("invoked another backend: %+v", call)
-				}
-			}
-		})
-	}
-}
-
-func TestContainersRecheckWritableAliasesBeforeExecAndStart(t *testing.T) {
-	sandboxTestNonroot(t)
-	for _, location := range []string{"worktree", "opencode", "admin", "objects", "refs", "logs", "rr-cache"} {
-		t.Run(location, func(t *testing.T) {
-			c, w, engine := sandboxTestFixture(t)
-			if err := os.MkdirAll(filepath.Join(w.CommonDir, "rr-cache"), 0700); err != nil {
-				t.Fatal(err)
-			}
-			if err := c.Ensure(context.Background(), w); err != nil {
-				t.Fatal(err)
-			}
-			identity, err := discoverSandboxGit(w.Path, w.CommonDir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dir := filepath.Join(w.CommonDir, location)
-			switch location {
-			case "worktree":
-				dir = w.Path
-			case "opencode":
-				dir = filepath.Join(c.HomeDir, ".local", "share", "opencode", "nested")
-			case "admin":
-				dir = identity.Admin
-			}
-			if err := os.MkdirAll(dir, 0700); err != nil {
-				t.Fatal(err)
-			}
-			sentinel := filepath.Join(filepath.Dir(w.Root), "outside-sentinel")
-			sandboxTestWrite(t, sentinel, "outside")
-			alias := filepath.Join(dir, "preexisting-alias")
-			if err := os.Link(sentinel, alias); err != nil {
-				t.Fatal(err)
-			}
+			found.Config.Labels[key] = "foreign"
+			defer func() { found.Config.Labels[key] = value }()
 			engine.calls = nil
-			if err := c.Exec(context.Background(), w, "printf changed > preexisting-alias", nil, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "--no-hardlinks") {
-				t.Fatalf("exec did not reject a writable alias: %v", err)
-			}
-			if got := c.PaneCommand(w, "opencode"); !slices.Equal(got, []string{"/usr/bin/false"}) {
-				t.Fatalf("pane accepted a writable alias: %v", got)
-			}
-			engine.container.State.Running = false
-			if err := c.Ensure(context.Background(), w); err == nil || !strings.Contains(err.Error(), "hard links") {
-				t.Fatalf("start accepted a writable alias: %v", err)
-			}
-			for _, call := range sandboxEngineCalls(engine) {
-				if args := sandboxTestCallArgs(call); args[0] == "exec" || args[0] == "start" || args[0] == "create" {
-					t.Fatalf("acted with unsafe writable aliases: %v", args)
+			for _, action := range []func(context.Context, Workspace) error{c.Stop, c.Remove} {
+				if err := action(t.Context(), w); err == nil {
+					t.Fatal("accepted mismatched ownership")
 				}
 			}
-			first, err := os.Stat(sentinel)
-			if err != nil {
-				t.Fatal(err)
+			for _, call := range sandboxEngineCalls(engine) {
+				if call.Args[0] == "stop" || call.Args[0] == "rm" {
+					t.Fatalf("acted on unowned resource: %v", call)
+				}
 			}
-			second, err := os.Stat(alias)
-			if err != nil || !os.SameFile(first, second) {
-				t.Fatalf("CLI silently replaced the existing hardlink: %v", err)
-			}
-			if data, err := os.ReadFile(sentinel); err != nil || string(data) != "outside" {
-				t.Fatalf("outside sentinel changed: %q %v", data, err)
-			}
-			if err := c.Remove(context.Background(), w); err != nil {
-				t.Fatalf("unsafe source should not prevent owned cleanup: %v", err)
+		})
+	}
+}
+
+func TestContainersLegacyPreservation(t *testing.T) {
+	c, w, engine := sandboxTestFixture(t)
+	found := sandboxTestLegacy(t, c, &w, engine)
+	w.Config.Sandbox.Image = "localhost/new-configured-image"
+	for _, action := range []func(context.Context, Workspace) error{c.Ensure, func(ctx context.Context, w Workspace) error { _, err := c.PaneCommand(ctx, w, "opencode"); return err }} {
+		if err := action(t.Context(), w); err == nil || !strings.Contains(err.Error(), "legacy persistent sandbox") {
+			t.Fatalf("no migration instruction: %v", err)
+		}
+		if engine.container != found || !found.State.Running {
+			t.Fatal("legacy container modified")
+		}
+	}
+	if err := c.Stop(t.Context(), w); err != nil {
+		t.Fatal(err)
+	}
+	if engine.container != found || found.State.Running {
+		t.Fatal("close deleted legacy data or did not stop")
+	}
+	if present, err := c.Exists(t.Context(), w); err != nil || !present {
+		t.Fatalf("stopped legacy forgotten: %v, %v", present, err)
+	}
+	if err := c.Remove(t.Context(), w); err != nil {
+		t.Fatal(err)
+	}
+	if engine.container != nil {
+		t.Fatal("explicit removal retained legacy resource")
+	}
+}
+
+func TestContainersLegacyEndpointProtection(t *testing.T) {
+	c, w, engine := sandboxTestFixture(t)
+	sandboxTestLegacy(t, c, &w, engine)
+	engine.info = strings.Replace(engine.info, "/tmp/cli-workmux-engine/store", "/tmp/different-store", 1)
+	engine.container = nil
+	if _, err := c.Exists(t.Context(), w); err == nil || !strings.Contains(err.Error(), "legacy sandbox engine identity changed") {
+		t.Fatalf("orphaned legacy data: %v", err)
+	}
+}
+
+func TestContainersMissingVersusUnavailable(t *testing.T) {
+	for _, failure := range []string{"container ls", "container inspect"} {
+		t.Run(failure, func(t *testing.T) {
+			c, w, engine := sandboxTestFixture(t)
+			engine.listing = "cli-workmux-present"
+			engine.fail[failure] = fmt.Errorf("engine unavailable")
+			if present, err := c.Exists(t.Context(), w); err == nil || present {
+				t.Fatalf("unavailable treated as absent: %v, %v", present, err)
 			}
 		})
 	}
 }
 
 func TestContainersProcessesSurviveDeletedCallerDirectory(t *testing.T) {
-	sandboxTestNonroot(t)
 	c, w, engine := sandboxTestFixture(t)
 	deleted := filepath.Join(t.TempDir(), "cwd")
 	if err := os.Mkdir(deleted, 0700); err != nil {
@@ -764,16 +530,10 @@ func TestContainersProcessesSurviveDeletedCallerDirectory(t *testing.T) {
 	if err := os.Remove(deleted); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Ensure(context.Background(), w); err != nil {
+	if err := c.Exec(t.Context(), w, "opencode", nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Exec(context.Background(), w, "opencode", nil, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Stop(context.Background(), w); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Remove(context.Background(), w); err != nil {
+	if err := c.Stop(t.Context(), w); err != nil {
 		t.Fatal(err)
 	}
 	for _, call := range engine.calls {
@@ -783,212 +543,238 @@ func TestContainersProcessesSurviveDeletedCallerDirectory(t *testing.T) {
 	}
 }
 
-func TestContainersRejectExplicitEmptyEngineConfig(t *testing.T) {
-	sandboxTestNonroot(t)
-	c, w, engine := sandboxTestFixture(t)
-	if err := c.Ensure(context.Background(), w); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("CONTAINERS_CONF", "")
-	engine.calls = nil
-	if err := c.Stop(context.Background(), w); err == nil || !strings.Contains(err.Error(), "CONTAINERS_CONF") || len(engine.calls) != 0 {
-		t.Fatalf("an empty config override is not the same as unset: %v, calls=%v", err, engine.calls)
-	}
-}
-
-func TestContainersOpenCodePreflight(t *testing.T) {
-	sandboxTestNonroot(t)
-	for _, test := range []struct {
-		name     string
-		xdg      bool
-		disabled bool
-		wantErr  bool
-	}{
-		{name: "missing directory", wantErr: true},
-		{name: "missing file", wantErr: true},
-		{name: "empty regular file"},
-		{name: "existing contents"},
-		{name: "XDG regular file", xdg: true},
-		{name: "XDG missing file", xdg: true, wantErr: true},
-		{name: "symlink", wantErr: true},
-		{name: "hardlink", wantErr: true},
-		{name: "directory", wantErr: true},
-		{name: "unreadable", wantErr: true},
-		{name: "pipe", wantErr: true},
-		{name: "config directory symlink", wantErr: true},
-		{name: "disabled", disabled: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			home := t.TempDir()
-			base := filepath.Join(home, ".config")
-			values := make(map[string]string)
-			if test.xdg {
-				// An initialized default directory must not hide an uninitialized XDG override.
-				sandboxTestWrite(t, filepath.Join(base, "opencode", ".gitignore"), "default")
-				base = filepath.Join(home, "custom config")
-				values["XDG_CONFIG_HOME"] = base
-			}
-			dir := filepath.Join(base, "opencode")
-			path := filepath.Join(dir, ".gitignore")
-			if test.name != "missing directory" && !test.disabled {
-				if err := os.MkdirAll(dir, 0700); err != nil {
-					t.Fatal(err)
+func TestContainersCleanupRacesAndFailures(t *testing.T) {
+	for _, action := range []string{"stop", "rm"} {
+		for _, disappeared := range []bool{false, true} {
+			t.Run(action+" disappeared="+strconv.FormatBool(disappeared), func(t *testing.T) {
+				c, w, engine := sandboxTestFixture(t)
+				for range 2 {
+					argv, err := c.PaneCommand(t.Context(), w, "opencode")
+					if err != nil {
+						t.Fatal(err)
+					}
+					sandboxTestSession(t, engine, argv)
 				}
-			}
-			switch test.name {
-			case "empty regular file", "XDG regular file":
-				sandboxTestWrite(t, path, "")
-			case "existing contents":
-				sandboxTestWrite(t, path, "# User-maintained content must not change.\n")
-			case "symlink", "hardlink":
-				target := filepath.Join(home, "outside")
-				sandboxTestWrite(t, target, "outside")
-				link := os.Symlink
-				if test.name == "hardlink" {
-					link = os.Link
+				engine.disappear = disappeared
+				failure := fmt.Errorf("engine action failed")
+				engine.fail[action] = failure
+				var err error
+				if action == "stop" {
+					err = c.Stop(t.Context(), w)
+				} else {
+					err = c.Remove(t.Context(), w)
 				}
-				if err := link(target, path); err != nil {
-					t.Fatal(err)
+				if disappeared && err != nil || !disappeared && !errors.Is(err, failure) {
+					t.Fatalf("cleanup result: %v", err)
 				}
-			case "directory":
-				if err := os.Mkdir(path, 0700); err != nil {
-					t.Fatal(err)
-				}
-			case "unreadable":
-				sandboxTestWrite(t, path, "")
-				if err := os.Chmod(path, 0000); err != nil {
-					t.Fatal(err)
-				}
-			case "pipe":
-				if err := syscall.Mkfifo(path, 0600); err != nil {
-					t.Fatal(err)
-				}
-			case "config directory symlink":
-				target := filepath.Join(home, "outside-config")
-				sandboxTestWrite(t, filepath.Join(target, ".gitignore"), "")
-				if err := os.Remove(dir); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(target, dir); err != nil {
-					t.Fatal(err)
-				}
-			}
-			before, beforeErr := os.Lstat(path)
-			engine := &sandboxTestEngine{image: "sha256:" + strings.Repeat("b", 64), info: sandboxTestInfo}
-			c := &Containers{Runner: engine, HomeDir: home, Getenv: func(key string) string { return values[key] }}
-			err := c.Check(context.Background(), SandboxConfig{Enabled: !test.disabled, Image: "localhost/test:local"})
-			if (err != nil) != test.wantErr {
-				t.Fatalf("OpenCode preflight error = %v", err)
-			}
-			if test.wantErr {
-				for _, text := range []string{path, dir, "readable regular .gitignore", "initialize OpenCode once on the host", "then retry"} {
-					if !strings.Contains(err.Error(), text) {
-						t.Fatalf("preflight lacks actionable path/setup details: %v", err)
+				attempts := 0
+				for _, call := range sandboxEngineCalls(engine) {
+					if call.Args[0] == action {
+						attempts++
 					}
 				}
-			}
-			if (test.wantErr || test.disabled) && len(engine.calls) != 0 {
-				t.Fatalf("preflight invoked an engine or host initialization: %+v", engine.calls)
-			}
-			if !test.wantErr && !test.disabled && len(engine.calls) != 2 {
-				t.Fatalf("initialized config did not continue to the image check: %+v", engine.calls)
-			}
-			after, afterErr := os.Lstat(path)
-			if os.IsNotExist(beforeErr) {
-				if !os.IsNotExist(afterErr) {
-					t.Fatalf("preflight created missing metadata: %v", afterErr)
+				if attempts != 2 {
+					t.Fatalf("cleanup did not attempt every owned session: %d", attempts)
 				}
-			} else if beforeErr != nil || afterErr != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() || !before.ModTime().Equal(after.ModTime()) {
-				t.Fatalf("preflight modified existing metadata: before=%v, after=%v", beforeErr, afterErr)
-			}
-			if test.name == "missing directory" || test.disabled {
-				if _, err := os.Lstat(dir); !os.IsNotExist(err) {
-					t.Fatalf("preflight created the config directory: %v", err)
-				}
-			}
-			if test.name == "existing contents" {
-				content, err := os.ReadFile(path)
-				if err != nil || string(content) != "# User-maintained content must not change.\n" {
-					t.Fatalf("preflight rewrote metadata: %q %v", content, err)
-				}
-			}
-		})
+			})
+		}
 	}
 }
 
-func TestContainersRevalidateOpenCodeMetadata(t *testing.T) {
-	sandboxTestNonroot(t)
-	c, w, engine := sandboxTestFixture(t)
-	path := filepath.Join(c.HomeDir, ".config", "opencode", ".gitignore")
-	if err := c.Check(context.Background(), w.Config.Sandbox); err != nil {
+func sandboxTestPodmanBinary(t *testing.T, dir, image, body string) {
+	t.Helper()
+	path := filepath.Join(dir, "podman")
+	script := "#!/bin/sh\n"
+	if image != "" {
+		script += "if [ \"$1\" = image ]; then\n  printf '%s' '[{\"Id\":\"" + image + "\"}]'\n  exit 0\nfi\n"
+	}
+	sandboxTestWrite(t, path, script+body+"\n")
+	if err := os.Chmod(path, 0700); err != nil {
 		t.Fatal(err)
 	}
-	for _, running := range []bool{false, true} {
-		if running {
-			sandboxTestWrite(t, path, "")
-			if err := c.Ensure(context.Background(), w); err != nil {
+}
+
+func TestContainersPaneCapturesNativeEngineEnvironment(t *testing.T) {
+	c, w, engine := sandboxTestFixture(t)
+	base := filepath.Dir(w.Root)
+	binA, binB := filepath.Join(base, "engine-a"), filepath.Join(base, "engine-b")
+	sandboxTestPodmanBinary(t, binA, "", "printf 'wrong backend A\\n' >&2\nexit 42")
+	sandboxTestPodmanBinary(t, binB, engine.image, "exec /usr/bin/env -0")
+	c.Runner = sandboxIntegrationRunner{home: c.HomeDir, base: base}
+	selected := make(map[string]string)
+	for _, key := range sandboxEngineEnvKeys {
+		value := filepath.Join(base, "caller-b", key) + " with 'quotes' $literal; = value"
+		if key == "PATH" {
+			value = binB + ":/usr/bin:/bin"
+		}
+		if key == "CONTAINER_CONNECTION" {
+			value = "podman-machine-b"
+		}
+		if key == "CONTAINERS_CONF_OVERRIDE" {
+			value = ""
+		}
+		t.Setenv(key, value)
+		selected[key] = value
+	}
+	if err := os.Unsetenv("CONTAINER_HOST"); err != nil {
+		t.Fatal(err)
+	}
+	delete(selected, "CONTAINER_HOST")
+	argv, err := c.PaneCommand(t.Context(), w, "opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range sandboxEngineEnvKeys {
+		t.Setenv(key, "late-server-a")
+	}
+	t.Setenv("PATH", binA+":/usr/bin:/bin")
+	out, err := c.Runner.Run(t.Context(), Process{Name: argv[0], Args: argv[1:], Dir: "/"})
+	if err != nil {
+		t.Fatalf("prepared command switched backends: %v", err)
+	}
+	actual := make(map[string]string)
+	for entry := range bytes.SplitSeq(out, []byte{0}) {
+		if key, value, ok := strings.Cut(string(entry), "="); ok {
+			actual[key] = value
+		}
+	}
+	for _, key := range sandboxEngineEnvKeys {
+		want, present := selected[key]
+		got, exists := actual[key]
+		if got != want || exists != present {
+			t.Fatalf("selector %s = %q, present=%v; want %q, present=%v", key, got, exists, want, present)
+		}
+	}
+	if actual["HOME"] == c.HomeDir {
+		t.Fatal("fake OpenCode home replaced native engine home")
+	}
+	if got, err := c.PaneCommand(t.Context(), w, "opencode"); err == nil || len(got) != 0 || !strings.Contains(err.Error(), "wrong backend A") {
+		t.Fatalf("unavailable caller backend passed preflight: %q, %v", got, err)
+	}
+	sandboxTestPodmanBinary(t, binB, "", "printf 'selected backend B unavailable\\n' >&2\nexit 41")
+	marker := filepath.Join(base, "forbidden-host-fallback")
+	var stderr bytes.Buffer
+	_, err = c.Runner.Run(t.Context(), Process{Name: argv[0], Args: argv[1:], Dir: "/", Stdin: strings.NewReader("touch " + marker + "\n"), Stderr: &stderr})
+	var exited *exec.ExitError
+	if !errors.As(err, &exited) || exited.ExitCode() != 41 || !strings.Contains(stderr.String(), "selected backend B unavailable") {
+		t.Fatalf("backend error hidden or launch redirected: %v, %s", err, &stderr)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("failed launch created a host fallback: %v", err)
+	}
+}
+
+func TestContainersPaneRestoresCallerEngineInTmux(t *testing.T) {
+	c, w, engine := sandboxTestFixture(t)
+	base := filepath.Dir(w.Root)
+	binA, binB := filepath.Join(base, "engine-a"), filepath.Join(base, "engine-b")
+	marker := filepath.Join(base, "selected-engine")
+	sandboxTestPodmanBinary(t, binA, "", "printf 'wrong backend A\\n' >&2\nexit 42")
+	sandboxTestPodmanBinary(t, binB, engine.image, `printf '%s\n' "$CONTAINER_CONNECTION" "$HOME" "${CONTAINER_HOST-unset}" > `+strconv.Quote(marker))
+	c.Runner = sandboxIntegrationRunner{home: c.HomeDir, base: base}
+	t.Setenv("CONTAINER_CONNECTION", "machine-a")
+	t.Setenv("CONTAINER_HOST", "ssh://server-a.invalid")
+	t.Setenv("PATH", binA+":/usr/bin:/bin")
+	ctx, runner, _, session := isolatedTmux(t)
+	callerHome := filepath.Join(base, "native-caller-home")
+	t.Setenv("HOME", callerHome)
+	t.Setenv("CONTAINER_CONNECTION", "machine-b")
+	if err := os.Unsetenv("CONTAINER_HOST"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binB+":/usr/bin:/bin")
+	argv, err := c.PaneCommand(ctx, w, "opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CONTAINER_CONNECTION", "late-machine-a")
+	t.Setenv("PATH", binA+":/usr/bin:/bin")
+	if _, err := runner.Run(ctx, Process{Name: "tmux", Args: []string{"set-option", "-g", "remain-on-exit", "on"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the complete argv in the server's environment without the PTY input queue.
+	args := []string{"new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session + ":", "-c", w.Path, "--", "/bin/sh", "-c", nativeShellCommand(argv, "/bin/sh")}
+	created, err := runner.Run(ctx, Process{Name: "tmux", Args: args})
+	if err != nil {
+		t.Fatal(err)
+	}
+	window := strings.TrimSpace(string(created))
+	want := "machine-b\n" + callerHome + "\nunset\n"
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		out, err := os.ReadFile(marker)
+		if err == nil && string(out) == want {
+			break
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			capture, captureErr := runner.Run(ctx, Process{Name: "tmux", Args: []string{"capture-pane", "-p", "-t", window}})
+			t.Fatalf("tmux launch did not preserve caller B: %q, %v; capture %v:\n%s", out, err, captureErr, capture)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type sandboxRoutingTestRunner struct {
+	engines      map[string]*sandboxTestEngine
+	afterInspect func()
+}
+
+func (runner sandboxRoutingTestRunner) Run(ctx context.Context, p Process) ([]byte, error) {
+	connection := os.Getenv("CONTAINER_CONNECTION")
+	if p.Name == "/usr/bin/env" {
+		connection = ""
+		for _, arg := range p.Args {
+			if arg == "podman" {
+				break
+			}
+			if value, ok := strings.CutPrefix(arg, "CONTAINER_CONNECTION="); ok {
+				connection = value
+			}
+		}
+	}
+	engine := runner.engines[connection]
+	if engine == nil {
+		return nil, fmt.Errorf("unknown test connection %q", connection)
+	}
+	out, err := engine.Run(ctx, p)
+	process := sandboxTestPodmanProcess(p)
+	if slices.Equal(process.Args[:2], []string{"container", "inspect"}) && runner.afterInspect != nil {
+		runner.afterInspect()
+	}
+	return out, err
+}
+
+func TestContainersCleanupKeepsInspectedConnection(t *testing.T) {
+	for _, remove := range []bool{false, true} {
+		t.Run("remove="+strconv.FormatBool(remove), func(t *testing.T) {
+			c, w, engineB := sandboxTestFixture(t)
+			t.Setenv("CONTAINER_CONNECTION", "machine-b")
+			argv, err := c.PaneCommand(t.Context(), w, "opencode")
+			if err != nil {
 				t.Fatal(err)
 			}
-		}
-		if err := os.Remove(path); err != nil {
-			t.Fatal(err)
-		}
-		engine.calls = nil
-		if err := c.Ensure(context.Background(), w); err == nil || !strings.Contains(err.Error(), path) {
-			t.Fatalf("Ensure did not revalidate OpenCode metadata: %v", err)
-		}
-		if _, err := c.mountPlan(context.Background(), w, engine.image, !running); err == nil || !strings.Contains(err.Error(), path) {
-			t.Fatalf("mount planning did not revalidate OpenCode metadata: %v", err)
-		}
-		if err := c.Exec(context.Background(), w, "opencode", nil, nil, nil, nil); err == nil || !strings.Contains(err.Error(), path) {
-			t.Fatalf("exec did not revalidate OpenCode metadata: %v", err)
-		}
-		if len(engine.calls) != 0 {
-			t.Fatalf("missing metadata was checked after engine operations: %+v", engine.calls)
-		}
-		if !running {
-			if _, err := os.Stat(c.StateDir); !os.IsNotExist(err) {
-				t.Fatalf("failed preflight provisioned private state: %v", err)
+			owned := sandboxTestSession(t, engineB, argv)
+			foreign := *owned
+			foreign.Config.Labels = map[string]string{sandboxLabel + "owner": "another-tool"}
+			engineA := &sandboxTestEngine{sessions: []*sandboxInspection{&foreign}}
+			c.Runner = sandboxRoutingTestRunner{engines: map[string]*sandboxTestEngine{"machine-a": engineA, "machine-b": engineB}, afterInspect: func() { t.Setenv("CONTAINER_CONNECTION", "machine-a") }}
+			if remove {
+				err = c.Remove(t.Context(), w)
+			} else {
+				err = c.Stop(t.Context(), w)
 			}
-		} else if engine.container == nil || !engine.container.State.Running {
-			t.Fatal("failed revalidation stopped or replaced the running container")
-		}
-	}
-	if err := c.Stop(context.Background(), w); err != nil {
-		t.Fatalf("missing OpenCode metadata must not prevent owned cleanup: %v", err)
-	}
-	if err := c.Remove(context.Background(), w); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestContainersAddPreflightBeforeGitMutation(t *testing.T) {
-	f := newHostFixture(t, "sandbox: {enabled: true}\n")
-	engine := &sandboxTestEngine{image: "sha256:" + strings.Repeat("b", 64), info: sandboxTestInfo, home: f.home}
-	f.app.Sandbox = &Containers{Runner: engine, HomeDir: f.home, StateDir: f.state}
-	metadata := filepath.Join(f.home, "xdgconfig", "opencode", ".gitignore")
-	beforeRefs := hostGit(t, f.root, "show-ref")
-	beforeTrees := hostGit(t, f.root, "worktree", "list", "--porcelain")
-	beforeStatus := hostGit(t, f.root, "status", "--porcelain")
-	if err := f.run(t, "add", "needs-opencode-metadata", "-b"); err == nil || !strings.Contains(err.Error(), metadata) {
-		t.Fatalf("add did not fail at the real sandbox preflight: %v", err)
-	}
-	if len(engine.calls) != 0 {
-		t.Fatalf("add started the image check before metadata preflight: %+v", engine.calls)
-	}
-	for _, event := range f.events {
-		if strings.HasPrefix(event, "git:") || strings.HasPrefix(event, "hook:") || event == "mux:create" {
-			t.Fatalf("add mutated resources after failed sandbox preflight: %q", f.events)
-		}
-	}
-	if hostGit(t, f.root, "show-ref") != beforeRefs || hostGit(t, f.root, "worktree", "list", "--porcelain") != beforeTrees || hostGit(t, f.root, "status", "--porcelain") != beforeStatus {
-		t.Fatal("failed sandbox preflight changed Git refs, worktrees or tracked files")
-	}
-	path := workspacePath(f.root, "needs-opencode-metadata")
-	common := filepath.Join(f.root, ".git")
-	for _, path := range []string{path, metadata, filepath.Join(f.state, identity(common), identity(common, path)+".json")} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("failed preflight provisioned %s: %v", path, err)
-		}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(engineB.sessions) != 0 || len(engineA.sessions) != 1 || !foreign.State.Running {
+				t.Fatal("cleanup switched connection after validating ownership")
+			}
+			if err := c.Remove(t.Context(), w); err != nil {
+				t.Fatal(err)
+			}
+			if len(engineA.sessions) != 1 {
+				t.Fatal("future connection selection deleted an unrelated container")
+			}
+		})
 	}
 }

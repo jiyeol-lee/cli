@@ -1,6 +1,7 @@
 package workmux
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -64,6 +65,38 @@ func TestGitProtectionAndEnvironment(t *testing.T) {
 	for _, arg := range p.Args {
 		if strings.HasPrefix(arg, "filter.") || strings.HasPrefix(arg, "merge.") && arg != "merge.autoStash=false" || arg == "-C" {
 			t.Fatalf("unexpected Git override %s", arg)
+		}
+	}
+}
+
+func TestInteractiveGitRetainsNonEditorProtectionAndIO(t *testing.T) {
+	t.Setenv("GIT_EDITOR", "/configured/editor --wait")
+	t.Setenv("GIT_SEQUENCE_EDITOR", "/configured/sequence-editor")
+	runner := &tmuxTestRunner{}
+	stdin := strings.NewReader("editor input")
+	var stdout, stderr bytes.Buffer
+	dir := t.TempDir()
+	app := App{Runner: runner, Stdin: stdin, Stdout: &stdout, Stderr: &stderr}
+	if err := app.interactiveGit(t.Context(), dir, "commit"); err != nil {
+		t.Fatal(err)
+	}
+	p := runner.calls[0]
+	if p.Name != "git" || p.Dir != dir || !p.CleanGitEnv || p.Stdin != stdin || p.Stdout != &stdout || p.Stderr != &stderr {
+		t.Fatalf("interactive process lost isolation or injected I/O: %+v", p)
+	}
+	for _, setting := range gitProtection {
+		index := slices.Index(p.Args, setting)
+		if strings.HasPrefix(setting, "core.editor=") || strings.HasPrefix(setting, "sequence.editor=") {
+			if index != -1 {
+				t.Fatalf("interactive editor was disabled by %s", setting)
+			}
+		} else if index < 1 || p.Args[index-1] != "-c" {
+			t.Fatalf("interactive Git dropped protection %s: %q", setting, p.Args)
+		}
+	}
+	for _, value := range []string{"GIT_EDITOR=/configured/editor --wait", "GIT_SEQUENCE_EDITOR=/configured/sequence-editor"} {
+		if !slices.Contains(p.Env, value) {
+			t.Fatalf("ambient editor was removed: %q", p.Env)
 		}
 	}
 }
@@ -152,13 +185,13 @@ func TestGitRefusesLinkedControlSymlinksAndHardlinks(t *testing.T) {
 	}
 }
 
-func TestGitRefusesBareSubmoduleAndMainRemoval(t *testing.T) {
+func TestGitAcceptsBareAndRefusesSubmoduleAndMainRemoval(t *testing.T) {
 	f := newHostFixture(t, "")
 	bare := filepath.Join(f.home, "bare")
 	hostGit(t, f.home, "init", "--bare", bare)
 	g := gitHost{runner: f.runner}
-	if _, err := g.discover(context.Background(), bare); err == nil {
-		t.Fatal("accepted bare repository")
+	if repo, err := g.discover(context.Background(), bare); err != nil || repo.Root != bare || repo.CommonDir != bare {
+		t.Fatalf("bare repository = %+v, %v", repo, err)
 	}
 	sub := filepath.Join(f.root, "sub")
 	hostGit(t, f.root, "-c", "protocol.file.allow=always", "submodule", "add", f.root, sub)
@@ -184,6 +217,48 @@ func TestGitBranchNamesDoNotExpandOrInject(t *testing.T) {
 	}
 	if got, err := g.branchName(context.Background(), f.root, "feature/topic"); err != nil || got != "feature-topic" {
 		t.Fatalf("valid branch = %s, %v", got, err)
+	}
+}
+
+func TestGitSeparateAndBareLinkedWorktrees(t *testing.T) {
+	for _, kind := range []string{"separate", "bare"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newHostFixture(t, "")
+			root := filepath.Join(t.TempDir(), "repository")
+			common := root
+			if kind == "bare" {
+				hostGit(t, f.root, "clone", "--bare", f.root, root)
+			} else {
+				common = filepath.Join(t.TempDir(), "metadata")
+				hostGit(t, f.root, "clone", "--separate-git-dir", common, f.root, root)
+			}
+			path := filepath.Join(t.TempDir(), "linked")
+			hostGit(t, root, "worktree", "add", "-b", "topic", path)
+			g := gitHost{runner: f.runner}
+			repo, err := g.discover(t.Context(), root)
+			if err != nil || repo.Root != root || repo.CommonDir != common {
+				t.Fatalf("discover = %+v, %v", repo, err)
+			}
+			if _, err := g.source(t.Context(), repo, Workspace{Path: path, Branch: "topic"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := g.source(t.Context(), repo, Workspace{Path: root, Branch: "main"}); err == nil {
+				t.Fatal("main or bare repository can be removed")
+			}
+		})
+	}
+}
+
+func TestWorkspaceSlugCommonNames(t *testing.T) {
+	for _, test := range []struct{ name, slug string }{
+		{"My Cool Feature", "my-cool-feature"}, {"Feature! @#$%", "feature"},
+		{"feature/auth/oauth", "feature-auth-oauth"}, {"Release_1.2", "release-1-2"},
+		{"  Workmux Test  ", "workmux-test"}, {"FOO/Bar_Baz", "foo-bar-baz"},
+		{"___...!!!", ""},
+	} {
+		if got := workspaceSlug(test.name); got != test.slug {
+			t.Errorf("workspaceSlug(%q) = %q, want %q", test.name, got, test.slug)
+		}
 	}
 }
 

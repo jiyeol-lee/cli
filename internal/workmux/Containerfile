@@ -7,19 +7,10 @@ RUN /bin/bash -euc ' \
     install -d -m 1777 /tmp/.local /tmp/.local/share /tmp/.local/state /tmp/.local/bin /tmp/.config /tmp/.cache \
     '
 
-RUN /bin/bash -euc ' \
-    case "$(uname -m)" in \
-      x86_64) artifact=opencode-linux-x64-baseline.tar.gz; checksum=60c92147d0d86ca606dda8a77260d3c87e0ef959eb2d8dbffb34df6d8a64e063 ;; \
-      aarch64) artifact=opencode-linux-arm64.tar.gz; checksum=4111a55c2a02c0fac314bd51e9a2330280e6d29d2b85b9554fff6d62612566ed ;; \
-      *) printf "Unsupported architecture\n" >&2; exit 1 ;; \
-    esac; \
-    directory=$(mktemp -d); \
-    curl --fail --location --proto =https --tlsv1.2 --retry 3 --output "$directory/opencode.tar.gz" "https://github.com/anomalyco/opencode/releases/download/v1.18.30/$artifact"; \
-    printf "%s  %s\n" "$checksum" "$directory/opencode.tar.gz" | sha256sum --check --strict; \
-    tar --extract --gzip --file "$directory/opencode.tar.gz" --directory "$directory" --no-same-owner; \
-    install -m 0755 "$directory/opencode" /usr/local/bin/opencode; \
-    rm -rf "$directory" \
-    '
+RUN curl -fsSL --output /tmp/opencode-install.sh https://opencode.ai/install
+RUN HOME=/root SHELL=/bin/bash bash /tmp/opencode-install.sh --no-modify-path
+RUN install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode
+RUN rm -rf /root/.opencode /tmp/opencode-install.sh
 
 ENV HOME=/tmp \
     XDG_DATA_HOME=/tmp/.local/share \
@@ -30,4 +21,4 @@ ENV HOME=/tmp \
 
 USER 1000:1000
 WORKDIR /tmp
-CMD ["/usr/bin/sleep", "infinity"]
+CMD ["opencode"]

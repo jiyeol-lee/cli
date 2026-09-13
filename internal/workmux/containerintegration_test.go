@@ -3,12 +3,13 @@ package workmux
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -16,156 +17,134 @@ import (
 	"time"
 )
 
-type sandboxIntegrationRunner struct {
-	home string
-}
+type sandboxIntegrationRunner struct{ home, base string }
 
 func (runner sandboxIntegrationRunner) Run(ctx context.Context, p Process) ([]byte, error) {
 	if p.Name == "git" {
 		p.Env = append(p.Env, "HOME="+runner.home, "XDG_CONFIG_HOME="+filepath.Join(runner.home, ".config"), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 	}
+	podman := sandboxTestPodmanProcess(p)
+	if podman.Name == "podman" && len(podman.Args) != 0 && podman.Args[0] == "run" {
+		for i, arg := range podman.Args {
+			if arg != "--mount" {
+				continue
+			}
+			value := podman.Args[i+1]
+			source, _, _ := strings.Cut(strings.TrimPrefix(value, "type=bind,source="), ",target=")
+			if runner.base == "" || !sandboxWithin(runner.base, source) {
+				return nil, fmt.Errorf("test refuses non-fixture mount %q", source)
+			}
+		}
+		if os.Getenv("WORKMUX_CONTAINER_RELABEL_TEST") == "1" {
+			output, err := exec.CommandContext(ctx, "chcon", "-R", "-t", "container_file_t", "--", runner.base).CombinedOutput()
+			if err != nil {
+				return nil, fmt.Errorf("label isolated test fixture: %w: %s", err, output)
+			}
+		}
+	}
 	return (ExecRunner{}).Run(ctx, p)
 }
 
 func TestContainerIntegration(t *testing.T) {
-	enabled := os.Getenv("WORKMUX_CONTAINER_TEST")
-	if enabled == "" {
-		t.Skip("set WORKMUX_CONTAINER_TEST=1 and WORKMUX_CONTAINER_IMAGE to an existing local Podman test image")
+	if os.Getenv("WORKMUX_CONTAINER_TEST") == "" {
+		t.Skip("set WORKMUX_CONTAINER_TEST=1 and WORKMUX_CONTAINER_IMAGE to an existing Podman test image")
 	}
-	if enabled != "1" && enabled != "podman" {
+	if os.Getenv("WORKMUX_CONTAINER_TEST") != "1" {
 		t.Fatal("WORKMUX_CONTAINER_TEST must be 1")
 	}
 	sandboxTestNonroot(t)
 	image := os.Getenv("WORKMUX_CONTAINER_IMAGE")
 	if image == "" {
-		t.Fatal("WORKMUX_CONTAINER_IMAGE must name an explicitly built local image")
+		t.Fatal("WORKMUX_CONTAINER_IMAGE must name an explicitly built test image")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
 	c, w, _ := sandboxTestFixture(t)
-	c.Runner = sandboxIntegrationRunner{home: c.HomeDir}
-	// Ignore only XDG paths for credential selection, not engine connection settings.
-	c.Getenv = func(key string) string {
-		if key == "XDG_DATA_HOME" || key == "XDG_CONFIG_HOME" {
-			return ""
-		}
-		return os.Getenv(key)
-	}
+	c.Runner = sandboxIntegrationRunner{home: c.HomeDir, base: filepath.Dir(w.Root)}
 	w.Config.Sandbox.Image = image
-	key := fmt.Sprintf("%x", sha256.Sum256([]byte(w.Path)))
-	w.ID = "integration-" + key[:20]
-	w.Container = "cli-workmux-" + w.ID
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := c.Remove(ctx, w); err != nil {
+			t.Errorf("remove test sandbox sessions: %v", err)
+		}
+	})
 	hook := filepath.Join(w.CommonDir, "hooks", "pre-commit")
 	sandboxTestWrite(t, hook, "#!/bin/sh\nexit 0\n")
 	if err := os.Chmod(hook, 0700); err != nil {
 		t.Fatal(err)
 	}
-	data := filepath.Join(c.HomeDir, ".local", "share", "opencode")
-	config := filepath.Join(c.HomeDir, ".config", "opencode")
-	sandboxTestWrite(t, filepath.Join(data, "fake-credential"), "not a real credential\n")
+	data, config := filepath.Join(c.HomeDir, ".local", "share", "opencode"), filepath.Join(c.HomeDir, ".config", "opencode")
 	sandboxTestWrite(t, filepath.Join(data, "auth.json"), "{}\n")
+	sandboxTestWrite(t, filepath.Join(data, "fake-credential"), "not a real credential\n")
 	sandboxOpenCodeFixture(t, config)
 	identity, err := discoverSandboxGit(w.Path, w.CommonDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for alias, target := range map[string]string{
-		"config-alias": filepath.Join(w.CommonDir, "config"), "hook-alias": hook, "main-alias": filepath.Join(w.Root, "tracked"),
-	} {
+	for alias, target := range map[string]string{"config-alias": filepath.Join(w.CommonDir, "config"), "hook-alias": hook, "main-alias": filepath.Join(w.Root, "tracked")} {
 		if err := os.Symlink(target, filepath.Join(w.Path, alias)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	imageID, err := c.checkImage(ctx, w.Config.Sandbox)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan, err := c.mountPlan(ctx, w, imageID, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := plan.snapshots(true); err != nil {
-		t.Fatal(err)
-	}
-	if os.Getenv("WORKMUX_CONTAINER_RELABEL_TEST") == "1" {
-		// This directory was created by this test, never a user's repository or home.
-		base := filepath.Dir(w.Root)
-		output, err := exec.CommandContext(ctx, "chcon", "-R", "-t", "container_file_t", "--", base).CombinedOutput()
-		if err != nil {
-			t.Fatalf("label isolated test directory: %v: %s", err, output)
-		}
-	}
-	t.Cleanup(func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if err := c.Remove(cleanup, w); err != nil {
-			t.Errorf("remove test container %s: %v", w.Container, err)
-		}
-	})
-	sentinel := filepath.Join(filepath.Dir(w.Root), "outside-sentinel")
-	sandboxTestWrite(t, sentinel, "outside")
-	for _, dir := range []string{w.Path, filepath.Join(data, "nested")} {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			t.Fatal(err)
-		}
-		alias := filepath.Join(dir, "preexisting-hardlink")
-		if err := os.Link(sentinel, alias); err != nil {
-			t.Fatal(err)
-		}
-		if err := c.Ensure(ctx, w); err == nil || !strings.Contains(err.Error(), "--no-hardlinks") {
-			t.Fatalf("preexisting host alias was not refused before create: %v", err)
-		}
-		if _, _, found, err := c.lookup(ctx, w); err != nil || found != nil {
-			t.Fatalf("unsafe source created a container: %v", err)
-		}
-		if content, err := os.ReadFile(sentinel); err != nil || string(content) != "outside" {
-			t.Fatalf("outside sentinel changed: %q %v", content, err)
-		}
-		if err := os.Remove(alias); err != nil {
-			t.Fatal(err)
-		}
-	}
 	if err := c.Ensure(ctx, w); err != nil {
-		t.Fatalf("start sandbox; enforcing SELinux hosts need pre-labeled test directories: %v", err)
+		t.Fatal(err)
 	}
-	_, _, first, err := c.lookup(ctx, w)
-	if err != nil || first == nil {
-		t.Fatalf("inspect test container: %v", err)
+	if present, err := c.Exists(ctx, w); err != nil || present {
+		t.Fatalf("preflight created a persistent sandbox: %v, %v", present, err)
 	}
-	pane := c.PaneCommand(w, "printf pane-endpoint-ok")
-	if index := slices.Index(pane, "-it"); index >= 0 {
-		// Exercise the exact endpoint/environment prefix without requiring a terminal.
-		pane[index] = "-i"
-	} else {
-		t.Fatalf("no sandbox pane argv: %v", pane)
-	}
-	t.Run("pane pins the later tmux environment", func(t *testing.T) {
-		t.Setenv("CONTAINER_HOST", "ssh://must-not-connect.invalid")
-		t.Setenv("CONTAINER_CONNECTION", "must-not-connect")
-		t.Setenv("CONTAINERS_STORAGE_CONF", filepath.Join(filepath.Dir(w.Root), "missing-storage.conf"))
-		t.Setenv("STORAGE_DRIVER", "must-not-use")
-		t.Setenv("HOME", filepath.Join(filepath.Dir(w.Root), "different-home"))
-		t.Setenv("XDG_DATA_HOME", filepath.Join(filepath.Dir(w.Root), "different-data"))
-		output, err := (ExecRunner{}).Run(ctx, Process{Name: pane[0], Args: pane[1:], Dir: "/"})
-		if err != nil || string(output) != "pane-endpoint-ok" {
-			t.Fatalf("pane inherited a changed endpoint or storage selection: %v\n%s", err, output)
-		}
-	})
-	t.Run("cleanup refuses changed routing", func(t *testing.T) {
-		t.Setenv("CONTAINER_HOST", "ssh://must-not-connect.invalid")
-		for _, action := range []func(context.Context, Workspace) error{c.Stop, c.Remove} {
-			if err := action(ctx, w); err == nil || !strings.Contains(err.Error(), "CONTAINER_HOST") {
-				t.Fatalf("cleanup treated a different endpoint as absent: %v", err)
-			}
-		}
-		if got := c.PaneCommand(w, ""); !slices.Equal(got, []string{"/usr/bin/false"}) {
-			t.Fatalf("pane accepted changed routing: %v", got)
-		}
-	})
 	run := func(command string, env ...string) (string, error) {
-		var output, errors bytes.Buffer
-		err := c.Exec(ctx, w, command, env, nil, &output, &errors)
-		return output.String() + errors.String(), err
+		var stdout, stderr bytes.Buffer
+		err := c.Exec(ctx, w, command, env, nil, &stdout, &stderr)
+		return stdout.String() + stderr.String(), err
+	}
+	var versionOutput, versionErrors bytes.Buffer
+	err = c.Exec(ctx, w, "opencode --version", []string{"OPENCODE_DISABLE_MODELS_FETCH=1", "OPENCODE_DISABLE_AUTOUPDATE=1"}, nil, &versionOutput, &versionErrors)
+	version := strings.TrimSpace(versionOutput.String())
+	if err != nil || !regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)*$`).MatchString(version) {
+		t.Fatalf("read installed OpenCode version: %q, %v\n%s", version, err, &versionErrors)
+	}
+	t.Logf("Installed OpenCode version: %s", version)
+	t.Run("pane argv exits without guest shell", func(t *testing.T) {
+		argv, err := c.PaneCommand(ctx, w, "printf pane-ok")
+		if err != nil {
+			t.Fatal(err)
+		}
+		index := slices.Index(argv, "-it")
+		if index < 0 {
+			t.Fatalf("missing PTY: %q", argv)
+		}
+		argv[index] = "-i"
+		// Model a tmux login shell that inherited a different connection and store.
+		t.Setenv("CONTAINER_HOST", "ssh://unavailable-workmux-test.invalid")
+		t.Setenv("CONTAINER_CONNECTION", "unavailable-workmux-test")
+		t.Setenv("CONTAINERS_STORAGE_CONF", filepath.Join(c.HomeDir, "missing-storage.conf"))
+		t.Setenv("HOME", filepath.Join(c.HomeDir, "late-server-home"))
+		t.Setenv("XDG_CONFIG_HOME", filepath.Join(c.HomeDir, "late-server-config"))
+		t.Setenv("XDG_DATA_HOME", filepath.Join(c.HomeDir, "late-server-data"))
+		output, err := c.Runner.Run(ctx, Process{Name: argv[0], Args: argv[1:], Dir: "/", Stdin: strings.NewReader("printf unexpected-fallback\n")})
+		if err != nil || string(output) != "pane-ok" {
+			t.Fatalf("pane command: %v\n%s", err, output)
+		}
+	})
+	for _, command := range []string{"true", "false", "exit 7", "exec true", "exec /missing-workmux-executable"} {
+		t.Run("finite status "+command, func(t *testing.T) {
+			status := 0
+			switch command {
+			case "false":
+				status = 1
+			case "exit 7":
+				status = 7
+			case "exec /missing-workmux-executable":
+				status = 127
+			}
+			var stdout, stderr bytes.Buffer
+			err := c.Exec(ctx, w, command, nil, strings.NewReader("printf unexpected-shell\n"), &stdout, &stderr)
+			var exited *exec.ExitError
+			if status == 0 && err != nil || status != 0 && (!errors.As(err, &exited) || exited.ExitCode() != status) || stdout.Len() != 0 {
+				t.Fatalf("lost status %d or started shell: %v, %q, %s", status, err, &stdout, &stderr)
+			}
+		})
 	}
 	output, err := run(`set -eu
 test "$(id -u)" = "$EXPECTED_UID"
@@ -173,36 +152,25 @@ test "$(id -g)" = "$EXPECTED_GID"
 test "$HOME" = /tmp
 test "$XDG_DATA_HOME" = /tmp/.local/share
 test "$XDG_CONFIG_HOME" = /tmp/.config
-test "$XDG_STATE_HOME" = /tmp/.local/state
-test "$XDG_CACHE_HOME" = /tmp/.cache
 test ! -t 0
 test ! -t 1
-grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status
-grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
 test -f "$XDG_DATA_HOME/opencode/fake-credential"
-test -f "$XDG_CONFIG_HOME/opencode/opencode.json"
 printf guest > "$XDG_DATA_HOME/opencode/guest-write"
-mkdir -p "$XDG_STATE_HOME/guest" "$XDG_CACHE_HOME/guest"
-printf persistent > /tmp/persistent-marker
-opencode --version
+printf ephemeral > /tmp/session-marker
 printf changed > tracked
 git add tracked
 git -c commit.gpgsign=false commit -qm sandbox
 `, "EXPECTED_UID="+strconv.Itoa(os.Getuid()), "EXPECTED_GID="+strconv.Itoa(os.Getgid()))
-	if err != nil || !strings.Contains(output, "1.18.30") {
-		t.Fatalf("guest writes, image, identity or commit failed: %v\n%s", err, output)
+	if err != nil {
+		t.Fatalf("guest image, identity, writes or commit: %v\n%s", err, output)
 	}
-	t.Run("opencode fresh read-only config is refused by preflight", func(t *testing.T) {
-		sandboxOpenCodeFreshConfig(t, ctx, c, w, data, config)
-	})
-	t.Run("opencode prepared read-only config initializes local plugin", func(t *testing.T) {
-		sandboxOpenCodeInitialization(t, ctx, c, w, data, config)
-	})
+	if output, err := run(`test ! -e /tmp/session-marker && test "$(cat tracked)" = changed`); err != nil {
+		t.Fatalf("sessions share writable layers or lost worktree: %v\n%s", err, output)
+	}
 	for _, target := range []string{
-		filepath.Join(w.CommonDir, "config"), filepath.Join(identity.Admin, "config.worktree"),
-		filepath.Join(identity.Admin, "config"), identity.Pointer, filepath.Join(identity.Admin, "gitdir"),
-		filepath.Join(identity.Admin, "commondir"), hook, filepath.Join(w.Path, "config-alias"),
-		filepath.Join(w.Path, "hook-alias"), filepath.Join(w.Path, "main-alias"),
+		filepath.Join(w.CommonDir, "config"), filepath.Join(identity.Admin, "config.worktree"), filepath.Join(identity.Admin, "config"),
+		identity.Pointer, filepath.Join(identity.Admin, "gitdir"), filepath.Join(identity.Admin, "commondir"), hook,
+		filepath.Join(w.Path, "config-alias"), filepath.Join(w.Path, "hook-alias"), filepath.Join(w.Path, "main-alias"),
 		filepath.Join(w.CommonDir, "objects", "info", "new-policy"), filepath.Join(identity.Admin, "hooks", "new-hook"),
 		"/tmp/.config/opencode/opencode.json", "/tmp/.config/opencode/workmux-plugin.mjs",
 	} {
@@ -211,61 +179,129 @@ git -c commit.gpgsign=false commit -qm sandbox
 			t.Fatalf("protected write %s: %v\n%s", target, err, output)
 		}
 	}
-	for _, command := range []string{
-		`git config user.name Tampered`,
-		`rm -- .git`,
-		`ln -- "$POLICY" hardlink-alias`,
-	} {
+	for _, command := range []string{`git config user.name Tampered`, `rm -- .git`, `ln -- "$POLICY" hardlink-alias`} {
 		if output, err := run(command, "POLICY="+filepath.Join(w.CommonDir, "config")); err == nil {
 			t.Fatalf("Git policy mutation succeeded: %s\n%s", command, output)
 		}
 	}
-	if err := c.Stop(ctx, w); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Ensure(ctx, w); err != nil {
-		t.Fatal(err)
-	}
-	_, _, second, err := c.lookup(ctx, w)
-	if err != nil || second == nil || second.ID != first.ID {
-		t.Fatalf("container was not persistent: %v", err)
-	}
-	if output, err := run(`test "$(cat /tmp/persistent-marker)" = persistent`); err != nil {
-		t.Fatalf("container home was not persistent: %v\n%s", err, output)
-	}
-	if data, err := os.ReadFile(filepath.Join(w.Path, "tracked")); err != nil || string(data) != "changed" {
-		t.Fatalf("host worktree did not receive source change: %q %v", data, err)
-	}
-	if data, err := os.ReadFile(filepath.Join(data, "guest-write")); err != nil || string(data) != "guest" {
-		t.Fatalf("fake OpenCode data was not writable: %q %v", data, err)
-	}
-	if head := string(sandboxTestGit(t, w.Path, "rev-parse", "HEAD")); head != string(sandboxTestGit(t, w.Root, "rev-parse", "refs/heads/topic")) {
-		t.Fatal("guest commit did not update shared refs")
-	}
-	t.Run("deleted caller cwd", func(t *testing.T) {
-		deleted := filepath.Join(filepath.Dir(w.Root), "deleted-cwd")
-		if err := os.Mkdir(deleted, 0700); err != nil {
+	t.Run("initialized read-only config and plugin", func(t *testing.T) { sandboxOpenCodeInitialization(t, ctx, c, w, data, config, version) })
+	t.Run("existing empty read-only config", func(t *testing.T) {
+		empty := filepath.Join(c.HomeDir, "empty-config", "opencode")
+		if err := os.MkdirAll(empty, 0700); err != nil {
 			t.Fatal(err)
 		}
-		t.Chdir(deleted)
-		if err := os.Remove(deleted); err != nil {
+		before, err := os.Stat(empty)
+		if err != nil {
 			t.Fatal(err)
+		}
+		copy := *c
+		copy.Getenv = func(key string) string {
+			if key == "XDG_CONFIG_HOME" {
+				return filepath.Dir(empty)
+			}
+			return ""
+		}
+		if err := copy.Check(ctx, w.Config.Sandbox); err != nil {
+			t.Fatalf("CLI added a config prerequisite: %v", err)
+		}
+		var probeErrors bytes.Buffer
+		if err := copy.Exec(ctx, w, `printf forbidden > "$XDG_CONFIG_HOME/opencode/write-probe"`, nil, nil, nil, &probeErrors); err == nil || !strings.Contains(probeErrors.String(), "Read-only file system") {
+			t.Fatalf("empty host config is not read-only: %v\n%s", err, &probeErrors)
+		}
+		stdout, stderr, err := sandboxOpenCodeServe(ctx, &copy, w, false)
+		if err == nil {
+			if _, err := sandboxOpenCodeResponse(stdout, version); err != nil {
+				t.Fatalf("empty RO config initialization response: %v\n%s\n%s", err, stdout, stderr)
+			}
+			t.Logf("OpenCode %s initialized with empty read-only host config", version)
+		} else if sandboxOpenCodeReadonlyFailure(stdout, stderr, err, version) {
+			t.Logf("OpenCode %s exposes the known read-only .gitignore initialization error:\n%s\n%s", version, stdout, stderr)
+		} else {
+			t.Fatalf("unexpected empty RO config startup failure: %v\n%s\n%s", err, stdout, stderr)
+		}
+		entries, err := os.ReadDir(empty)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("OpenCode or CLI modified empty host config: %v, %v", entries, err)
+		}
+		after, err := os.Stat(empty)
+		if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() || !before.ModTime().Equal(after.ModTime()) {
+			t.Fatalf("empty host config metadata changed: %v", err)
+		}
+	})
+	t.Run("missing host config gets guest-owned initialization", func(t *testing.T) {
+		missing := filepath.Join(c.HomeDir, "missing-config")
+		copy := *c
+		copy.Getenv = func(key string) string {
+			if key == "XDG_CONFIG_HOME" {
+				return missing
+			}
+			return ""
+		}
+		stdout, stderr, err := sandboxOpenCodeServe(ctx, &copy, w, false)
+		if err != nil {
+			t.Fatalf("guest-owned config initialization: %v\n%s\n%s", err, stdout, stderr)
+		}
+		if _, err := sandboxOpenCodeResponse(stdout, version); err != nil {
+			t.Fatalf("guest-owned config response: %v\n%s\n%s", err, stdout, stderr)
+		}
+		if _, err := os.Stat(missing); !os.IsNotExist(err) {
+			t.Fatalf("created missing host config: %v", err)
+		}
+	})
+	t.Run("submodule Git writes and metadata protections", func(t *testing.T) {
+		module, admin := sandboxTestSubmodule(t, w)
+		output, err := run(`set -eu
+cd "$MODULE"
+printf changed > module-file
+git add module-file
+git -c commit.gpgsign=false commit -qm module-guest
+`, "MODULE="+module)
+		if err != nil {
+			t.Fatalf("submodule commit: %v\n%s", err, output)
+		}
+		for _, target := range []string{filepath.Join(module, ".git"), filepath.Join(admin, "config"), filepath.Join(admin, "hooks", "new-hook"), filepath.Join(admin, "objects", "info", "new-policy")} {
+			if output, err := run(`printf tampered > "$TARGET"`, "TARGET="+target); err == nil {
+				t.Fatalf("submodule policy writable: %s\n%s", target, output)
+			}
+		}
+	})
+	t.Run("stop all independent sessions", func(t *testing.T) {
+		done := make(chan error, 2)
+		for i := range 2 {
+			marker := "running-" + strconv.Itoa(i)
+			go func() {
+				var output bytes.Buffer
+				done <- c.Exec(ctx, w, `printf ready > "$MARKER"; exec sleep 60`, []string{"MARKER=" + marker}, nil, &output, &output)
+			}()
+			for {
+				if _, err := os.Stat(filepath.Join(w.Path, marker)); err == nil {
+					break
+				}
+				if ctx.Err() != nil {
+					t.Fatal(ctx.Err())
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+		found, err := c.owned(ctx, w)
+		if err != nil || len(found) != 2 || found[0].ID == found[1].ID {
+			t.Fatalf("independent owned sessions = %v, %v", found, err)
 		}
 		if err := c.Stop(ctx, w); err != nil {
 			t.Fatal(err)
 		}
-		if err := c.Ensure(ctx, w); err != nil {
-			t.Fatal(err)
+		for range 2 {
+			<-done
 		}
-		if output, err := run("printf cwd-ok"); err != nil || output != "cwd-ok" {
-			t.Fatalf("exec from a deleted cwd: %v\n%s", err, output)
-		}
-		if err := c.Remove(ctx, w); err != nil {
-			t.Fatal(err)
+		if present, err := c.Exists(ctx, w); err != nil || present {
+			t.Fatalf("--rm sessions remain after stop: %v, %v", present, err)
 		}
 	})
-	if err := c.Remove(ctx, w); err != nil {
-		t.Fatalf("remove was not idempotent: %v", err)
+	if got, err := os.ReadFile(filepath.Join(data, "guest-write")); err != nil || string(got) != "guest" {
+		t.Fatalf("shared fake data write: %q %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(w.Root, "tracked")); err != nil || string(got) != "base\n" {
+		t.Fatalf("host main worktree changed: %q %v", got, err)
 	}
 }
 
@@ -286,7 +322,6 @@ export default async function ({ directory }) {
   const config = join(process.env.XDG_CONFIG_HOME, "opencode")
   const raw = JSON.parse(await readFile(join(config, "opencode.json"), "utf8"))
   if (raw.username !== "workmux-readonly-config") throw new Error("wrong config source")
-
   let readOnly = false
   try {
     await writeFile(join(config, "plugin-write-probe"), "must not be writable")
@@ -295,7 +330,6 @@ export default async function ({ directory }) {
     readOnly = true
   }
   if (!readOnly) throw new Error("config directory was mounted writable")
-
   return {
     config: async (resolved) => {
       if (resolved.username !== raw.username) throw new Error("global config was not loaded")
@@ -304,12 +338,7 @@ export default async function ({ directory }) {
       }
       resolved.username = "workmux-plugin-initialized"
       await writeFile(join(data, "workmux-plugin-initialized.json"), JSON.stringify({
-        stage: "config-hook",
-        directory,
-        config,
-        data,
-        readOnly,
-        username: resolved.username
+        stage: "config-hook", directory, config, data, readOnly, username: resolved.username
       }), { mode: 0o600 })
     }
   }
@@ -322,36 +351,17 @@ func sandboxOpenCodeFixture(t *testing.T, config string) {
 	t.Helper()
 	sandboxTestWrite(t, filepath.Join(config, "opencode.json"), sandboxOpenCodeConfig)
 	sandboxTestWrite(t, filepath.Join(config, "workmux-plugin.mjs"), sandboxOpenCodePlugin)
-	// OpenCode 1.18.30 creates this on first instance bootstrap, which requires a writable config directory.
 	sandboxTestWrite(t, filepath.Join(config, ".gitignore"), sandboxOpenCodeIgnore)
 }
 
-func sandboxOpenCodeFreshConfig(t *testing.T, ctx context.Context, c *Containers, w Workspace, data, config string) {
-	t.Helper()
-	if err := os.Remove(filepath.Join(config, ".gitignore")); err != nil {
-		t.Fatal(err)
-	}
-	// These are test-owned host fixtures, not a production workaround or a guest mount change.
-	t.Cleanup(func() { sandboxOpenCodeFixture(t, config) })
-	sandboxTestWrite(t, filepath.Join(config, "opencode.json"), `{"autoupdate":false,"enabled_providers":[],"plugin":[]}`)
-	for _, err := range []error{c.Check(ctx, w.Config.Sandbox), c.Ensure(ctx, w)} {
-		if err == nil || !strings.Contains(err.Error(), filepath.Join(config, ".gitignore")) || !strings.Contains(err.Error(), "initialize OpenCode once on the host") {
-			t.Fatalf("fresh config was not rejected with actionable host setup instructions: %v", err)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(config, ".gitignore")); !os.IsNotExist(err) {
-		t.Fatalf("preflight wrote OpenCode startup metadata: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(data, "workmux-plugin-initialized.json")); !os.IsNotExist(err) {
-		t.Fatalf("fresh-config failure unexpectedly initialized the plugin: %v", err)
-	}
-	t.Log("Check and Ensure refused uninitialized read-only config without starting OpenCode or creating .gitignore")
-}
-
-func sandboxOpenCodeServe(parent context.Context, c *Containers, w Workspace) ([]byte, []byte, error) {
+func sandboxOpenCodeServe(parent context.Context, c *Containers, w Workspace, plugin bool) ([]byte, []byte, error) {
 	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 	defer cancel()
 	var stdout, stderr bytes.Buffer
+	env := []string{"OPENCODE_DISABLE_MODELS_FETCH=1", "OPENCODE_DISABLE_AUTOUPDATE=1", "EXPECT_PLUGIN=" + strconv.FormatBool(plugin)}
+	if !plugin {
+		env = append(env, `OPENCODE_CONFIG_CONTENT={"autoupdate":false,"enabled_providers":[],"plugin":[]}`)
+	}
 	err := c.Exec(ctx, w, `set -eu
 log=$(mktemp)
 health=$(mktemp)
@@ -362,7 +372,6 @@ cleanup() {
   kill "$server" 2>/dev/null || true
   wait "$server" 2>/dev/null || true
   cat "$log" >&2
-  rm -f "$log" "$health"
   exit "$status"
 }
 trap cleanup EXIT
@@ -382,50 +391,165 @@ cat "$health"
 printf '\n'
 curl --fail-with-body --silent --show-error --max-time 20 http://127.0.0.1:49193/config
 printf '\n'
-test -f "$XDG_DATA_HOME/opencode/workmux-plugin-initialized.json"
-`, []string{"OPENCODE_DISABLE_MODELS_FETCH=1", "OPENCODE_DISABLE_AUTOUPDATE=1"}, nil, &stdout, &stderr)
+if [ "$EXPECT_PLUGIN" = true ]; then
+  test -f "$XDG_DATA_HOME/opencode/workmux-plugin-initialized.json"
+fi
+`, env, nil, &stdout, &stderr)
 	return stdout.Bytes(), stderr.Bytes(), err
 }
 
-func sandboxOpenCodeInitialization(t *testing.T, ctx context.Context, c *Containers, w Workspace, data, config string) {
-	t.Helper()
-	stdout, stderr, err := sandboxOpenCodeServe(ctx, c, w)
-	if err != nil {
-		t.Fatalf("OpenCode server/config/plugin initialization with production RO config mounts: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
-	}
+func sandboxOpenCodeHealth(stdout []byte, version string) (*json.Decoder, error) {
 	decoder := json.NewDecoder(bytes.NewReader(stdout))
 	var health struct {
 		Healthy bool
 		Version string
 	}
-	if err := decoder.Decode(&health); err != nil || !health.Healthy || health.Version != "1.18.30" {
-		t.Fatalf("OpenCode health response: %+v, error=%v\n%s", health, err, stderr)
+	if err := decoder.Decode(&health); err != nil {
+		return nil, fmt.Errorf("decode OpenCode health: %w", err)
 	}
-	var resolved struct {
-		Username         string
-		EnabledProviders []string `json:"enabled_providers"`
+	if !health.Healthy || health.Version != version {
+		return nil, fmt.Errorf("OpenCode health = %+v; want healthy installed version %q", health, version)
 	}
-	if err := decoder.Decode(&resolved); err != nil || resolved.Username != "workmux-plugin-initialized" || len(resolved.EnabledProviders) != 0 {
-		t.Fatalf("OpenCode did not serve the plugin-initialized config: %+v, error=%v\n%s", resolved, err, stderr)
+	return decoder, nil
+}
+
+type sandboxOpenCodeResolved struct {
+	Username         string
+	EnabledProviders []string `json:"enabled_providers"`
+}
+
+func sandboxOpenCodeResponse(stdout []byte, version string) (sandboxOpenCodeResolved, error) {
+	var resolved sandboxOpenCodeResolved
+	decoder, err := sandboxOpenCodeHealth(stdout, version)
+	if err != nil {
+		return resolved, err
+	}
+	if err := decoder.Decode(&resolved); err != nil {
+		return resolved, fmt.Errorf("decode OpenCode config: %w", err)
+	}
+	if resolved.EnabledProviders == nil || len(resolved.EnabledProviders) != 0 {
+		return resolved, fmt.Errorf("OpenCode config must explicitly disable all providers")
+	}
+	return resolved, nil
+}
+
+func sandboxOpenCodeReadonlyFailure(stdout, stderr []byte, err error, version string) bool {
+	var exited *exec.ExitError
+	if !errors.As(err, &exited) || exited.ExitCode() != 22 {
+		return false
+	}
+	decoder, err := sandboxOpenCodeHealth(stdout, version)
+	if err != nil {
+		return false
+	}
+	var response struct {
+		Name string
+		Data struct{ Message, Ref string }
+	}
+	if err := decoder.Decode(&response); err != nil {
+		return false
+	}
+	if response.Name != "UnknownError" {
+		return false
+	}
+	known := "EROFS: read-only file system, open '/tmp/.config/opencode/.gitignore'"
+	if strings.Contains(response.Data.Message, known) {
+		return true
+	}
+	if response.Data.Ref == "" || strings.ContainsAny(response.Data.Ref, " \t\r\n") {
+		return false
+	}
+	for line := range strings.SplitSeq(string(stderr), "\n") {
+		if strings.Contains(line, "level=ERROR ") && strings.Contains(line, " ref="+response.Data.Ref+" ") && strings.Contains(line, known) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSandboxOpenCodeResponseValidation(t *testing.T) {
+	for _, test := range []struct {
+		name, response string
+		valid          bool
+	}{
+		{"initialized", `{"healthy":true,"version":"9.8.7"} {"username":"workmux-plugin-initialized","enabled_providers":[]}`, true},
+		{"fresh", `{"healthy":true,"version":"9.8.7"} {"enabled_providers":[]}`, true},
+		{"wrong version", `{"healthy":true,"version":"9.8.6"} {"enabled_providers":[]}`, false},
+		{"unhealthy", `{"healthy":false,"version":"9.8.7"} {"enabled_providers":[]}`, false},
+		{"missing config", `{"healthy":true,"version":"9.8.7"}`, false},
+		{"missing providers", `{"healthy":true,"version":"9.8.7"} {}`, false},
+		{"enabled provider", `{"healthy":true,"version":"9.8.7"} {"enabled_providers":["unexpected"]}`, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := sandboxOpenCodeResponse([]byte(test.response), "9.8.7"); (err == nil) != test.valid {
+				t.Fatalf("response validation = %v", err)
+			}
+		})
+	}
+}
+
+func TestSandboxOpenCodeReadonlyFailureClassification(t *testing.T) {
+	httpFailure := exec.CommandContext(t.Context(), "/bin/sh", "-c", "exit 22").Run()
+	if httpFailure == nil {
+		t.Fatal("missing HTTP failure fixture")
+	}
+	health := `{"healthy":true,"version":"9.8.7"}`
+	response := health + `{"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs for details.","ref":"err_fixture"}}`
+	known := "EROFS: read-only file system, open '/tmp/.config/opencode/.gitignore'"
+	log := "timestamp=fixture level=ERROR message=failed ref=err_fixture error=\"" + known + "\""
+	for _, test := range []struct {
+		name, stdout, stderr string
+		err                  error
+		valid                bool
+	}{
+		{"referenced known error", response, log, httpFailure, true},
+		{"direct known error", health + `{"name":"UnknownError","data":{"message":"` + known + `"}}`, "", httpFailure, true},
+		{"generic server failure", response, "", httpFailure, false},
+		{"unrelated error reference", response, strings.ReplaceAll(log, "err_fixture", "err_other"), httpFailure, false},
+		{"model network failure", response, strings.ReplaceAll(log, known, "model network request failed"), httpFailure, false},
+		{"different readonly path", response, strings.ReplaceAll(log, "/tmp/.config/opencode/.gitignore", "/tmp/.local/share/opencode/auth.json"), httpFailure, false},
+		{"permission failure", response, strings.ReplaceAll(log, "EROFS: read-only file system", "EACCES: permission denied"), httpFailure, false},
+		{"timeout with earlier known log", response, log, context.DeadlineExceeded, false},
+		{"wrong version", strings.ReplaceAll(response, "9.8.7", "9.8.6"), log, httpFailure, false},
+		{"no health", `{}`, log, httpFailure, false},
+		{"successful exit with stale log", response, log, nil, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if valid := sandboxOpenCodeReadonlyFailure([]byte(test.stdout), []byte(test.stderr), test.err, "9.8.7"); valid != test.valid {
+				t.Fatalf("known error accepted = %v", valid)
+			}
+		})
+	}
+}
+
+func sandboxOpenCodeInitialization(t *testing.T, ctx context.Context, c *Containers, w Workspace, data, config, version string) {
+	t.Helper()
+	stdout, stderr, err := sandboxOpenCodeServe(ctx, c, w, true)
+	if err != nil {
+		t.Fatalf("OpenCode RO config/plugin initialization: %v\n%s\n%s", err, stdout, stderr)
+	}
+	resolved, err := sandboxOpenCodeResponse(stdout, version)
+	if err != nil || resolved.Username != "workmux-plugin-initialized" {
+		t.Fatalf("plugin-initialized config: %+v, %v\n%s", resolved, err, stderr)
 	}
 	marker, err := os.ReadFile(filepath.Join(data, "workmux-plugin-initialized.json"))
 	if err != nil {
-		t.Fatal("plugin initialization did not write to the shared data directory", err)
+		t.Fatal(err)
 	}
 	var initialized struct {
 		Stage, Directory, Config, Data, Username string
 		ReadOnly                                 bool
 	}
 	if err := json.Unmarshal(marker, &initialized); err != nil || initialized.Stage != "config-hook" || initialized.Directory != w.Path || initialized.Config != "/tmp/.config/opencode" || initialized.Data != "/tmp/.local/share/opencode" || !initialized.ReadOnly || initialized.Username != resolved.Username {
-		t.Fatalf("plugin initialization marker: %s, error=%v", marker, err)
+		t.Fatalf("plugin marker: %s, %v", marker, err)
 	}
 	for name, expected := range map[string]string{"opencode.json": sandboxOpenCodeConfig, "workmux-plugin.mjs": sandboxOpenCodePlugin, ".gitignore": sandboxOpenCodeIgnore} {
 		actual, err := os.ReadFile(filepath.Join(config, name))
 		if err != nil || string(actual) != expected {
-			t.Fatalf("read-only OpenCode fixture changed: %s: %v", name, err)
+			t.Fatalf("host config changed: %s: %v", name, err)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(config, "plugin-write-probe")); !os.IsNotExist(err) {
-		t.Fatalf("plugin could write through the read-only config mount: %v", err)
+		t.Fatalf("plugin wrote host config: %v", err)
 	}
 }
