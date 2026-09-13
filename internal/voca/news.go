@@ -74,7 +74,7 @@ func (s APScraper) fetch(ctx context.Context, target string) (*html.Node, error)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("AP News returned %s", resp.Status)
 	}
@@ -504,18 +504,29 @@ func (TerminalPager) Show(ctx context.Context, page ArticlePage, stdin io.Reader
 	awk.Stdout = writer
 	less.Stdin, less.Stdout, less.Stderr = reader, stdout, stderr
 	if err := less.Start(); err != nil {
-		reader.Close()
-		writer.Close()
+		_ = reader.Close()
+		_ = writer.Close()
 		return fmt.Errorf("page article: %w", err)
 	}
-	reader.Close()
+	if err := reader.Close(); err != nil {
+		_ = writer.Close()
+		_ = less.Process.Kill()
+		_ = less.Wait()
+		return fmt.Errorf("close article pipe reader: %w", err)
+	}
 	if err := awk.Start(); err != nil {
-		writer.Close()
+		_ = writer.Close()
 		_ = less.Process.Kill()
 		_ = less.Wait()
 		return fmt.Errorf("format article: %w", err)
 	}
-	writer.Close()
+	if err := writer.Close(); err != nil {
+		_ = less.Process.Kill()
+		_ = awk.Process.Kill()
+		_ = less.Wait()
+		_ = awk.Wait()
+		return fmt.Errorf("close article pipe writer: %w", err)
+	}
 	lessErr := less.Wait()
 	awkErr := awk.Wait()
 	if awkErr != nil && !formatterPipeClosed(awkErr) {
@@ -560,7 +571,9 @@ func (n News) Run(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 		}
 		link, selectErr := selectArticle(articles, choice)
 		if selectErr != nil {
-			fmt.Fprintln(stderr, selectErr)
+			if _, writeErr := fmt.Fprintln(stderr, selectErr); writeErr != nil {
+				return errors.Join(selectErr, fmt.Errorf("write news error: %w", writeErr))
+			}
 			if err == io.EOF {
 				return nil
 			}
@@ -568,7 +581,9 @@ func (n News) Run(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 		}
 		page, fetchErr := n.Scraper.Article(ctx, link.URL)
 		if fetchErr != nil {
-			fmt.Fprintln(stderr, fetchErr)
+			if _, writeErr := fmt.Fprintln(stderr, fetchErr); writeErr != nil {
+				return errors.Join(fetchErr, fmt.Errorf("write news error: %w", writeErr))
+			}
 			if err == io.EOF {
 				return nil
 			}
@@ -585,11 +600,17 @@ func (n News) Run(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 
 func renderHeadlineTable(output io.Writer, articles []ArticleLink) error {
 	writer := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(writer, "Index\tTitle")
+	if _, err := fmt.Fprintln(writer, "Index\tTitle"); err != nil {
+		return err
+	}
 	for i, article := range articles {
-		fmt.Fprintf(writer, "%d\t%s\n", i+1, article.Title)
+		if _, err := fmt.Fprintf(writer, "%d\t%s\n", i+1, article.Title); err != nil {
+			return err
+		}
 		for j, related := range article.Related {
-			fmt.Fprintf(writer, "  %d-%d\t%s\n", i+1, j+1, related.Title)
+			if _, err := fmt.Fprintf(writer, "  %d-%d\t%s\n", i+1, j+1, related.Title); err != nil {
+				return err
+			}
 		}
 	}
 	return writer.Flush()

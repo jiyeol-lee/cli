@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -16,7 +17,7 @@ type BaselineQueryer interface {
 type BaselineValidator func(context.Context, BaselineQueryer) (bool, error)
 
 // AdoptBaseline records a validated schema that predates the migration ledger.
-func AdoptBaseline(ctx context.Context, db *sql.DB, app string, version int, name string, validate BaselineValidator) error {
+func AdoptBaseline(ctx context.Context, db *sql.DB, app string, version int, name string, validate BaselineValidator) (baselineErr error) {
 	if strings.TrimSpace(app) == "" || version < 1 || strings.TrimSpace(name) == "" {
 		return fmt.Errorf("invalid migration baseline")
 	}
@@ -24,11 +25,16 @@ func AdoptBaseline(ctx context.Context, db *sql.DB, app string, version int, nam
 	if err != nil {
 		return fmt.Errorf("get migration baseline connection for %s: %w", app, err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			baselineErr = errors.Join(baselineErr, fmt.Errorf("close migration baseline connection for %s: %w", app, err))
+		}
+	}()
 	if _, err := conn.ExecContext(ctx, beginImmediateSQL); err != nil {
 		return fmt.Errorf("begin migration baseline for %s: %w", app, err)
 	}
-	defer conn.ExecContext(context.Background(), rollbackSQL)
+	// Best-effort cleanup on failure; after COMMIT there is nothing to roll back.
+	defer func() { _, _ = conn.ExecContext(context.Background(), rollbackSQL) }()
 
 	if _, err := conn.ExecContext(ctx, createMigrationLedgerSQL); err != nil {
 		return fmt.Errorf("create migration ledger: %w", err)

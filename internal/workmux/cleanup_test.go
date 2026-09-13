@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,13 +26,17 @@ func TestMain(m *testing.M) {
 				os.Exit(2)
 			}
 			if path := os.Getenv("WORKMUX_TEST_WORKER_PID"); path != "" {
-				os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0600)
+				if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+					os.Exit(2)
+				}
 			}
 			switch os.Getenv("WORKMUX_TEST_WORKER_MODE") {
 			case "bad-ready":
 				file := os.NewFile(3, "ready")
-				file.WriteString("wrong acknowledgement\n")
-				file.Close()
+				_, writeErr := file.WriteString("wrong acknowledgement\n")
+				if err := errors.Join(writeErr, file.Close()); err != nil {
+					os.Exit(2)
+				}
 				os.Exit(0)
 			case "no-ready":
 				time.Sleep(30 * time.Second)
@@ -62,15 +67,19 @@ func TestMain(m *testing.M) {
 			}
 			app := cleanupProcessApp(paths)
 			app.Stdin, app.Stdout, app.Stderr = os.Stdin, os.Stdout, os.Stderr
+			var outputFile *os.File
 			if output := os.Getenv("WORKMUX_TEST_OUTPUT"); output != "" {
 				file, openErr := os.OpenFile(output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 				if openErr != nil {
 					os.Exit(1)
 				}
 				app.Stdout = file
-				defer file.Close()
+				outputFile = file
 			}
 			err = app.Run(context.Background(), command)
+			if outputFile != nil {
+				err = errors.Join(err, outputFile.Close())
+			}
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -127,7 +136,7 @@ func (runner cleanupProofRunner) Run(ctx context.Context, p Process) ([]byte, er
 		if tty, err := os.Open("/dev/tty"); err != nil {
 			proof.NoControllingTerminal = true
 		} else {
-			tty.Close()
+			_ = tty.Close()
 		}
 		zero, err0 := os.Stdin.Stat()
 		one, err1 := os.Stdout.Stat()
@@ -157,6 +166,13 @@ func (spawn cleanupSpawnFunc) Start(ctx context.Context, launch CleanupLaunch) e
 type cleanupReadyFunc func([]byte) (int, error)
 
 func (ready cleanupReadyFunc) Write(data []byte) (int, error) { return ready(data) }
+
+type cleanupReadyCloser struct {
+	cleanupReadyFunc
+	err error
+}
+
+func (ready cleanupReadyCloser) Close() error { return ready.err }
 
 type cleanupRunFunc func(context.Context, Process) ([]byte, error)
 
@@ -298,6 +314,94 @@ func TestCleanupSpawnFailureDoesNotCloseCaller(t *testing.T) {
 	}
 }
 
+func TestCleanupDiagnosticErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "diagnostic")
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, path string
+		flag       int
+		want       error
+	}{
+		{"write", path, os.O_RDONLY, syscall.EBADF},
+		{"sync", os.DevNull, os.O_WRONLY, syscall.EINVAL},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file, err := os.OpenFile(test.path, test.flag, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := file.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			if err := cleanupDiagnostic(file, "queued"); !errors.Is(err, test.want) || !strings.Contains(err.Error(), test.name+" cleanup diagnostic") {
+				t.Fatalf("diagnostic error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCleanupDiagnosticFailureDoesNotCancelScheduledJob(t *testing.T) {
+	f := newHostFixture(t, "")
+	if err := f.run(t, "add", "topic", "-b"); err != nil {
+		t.Fatal(err)
+	}
+	f.mux.caller = true
+	f.app.Spawner = cleanupSpawnFunc(func(_ context.Context, launch CleanupLaunch) error {
+		if err := launch.Stderr.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return nil
+	})
+	if err := f.run(t, "remove", "topic", "--keep-branch"); !errors.Is(err, os.ErrClosed) || !strings.Contains(err.Error(), "write cleanup diagnostic") {
+		t.Fatalf("lost diagnostic failure: %v", err)
+	}
+	state := f.load(t, "topic")
+	if state.Removal.Job.Status != "armed" || state.Removal.WorktreeRemoved || f.mux.window == "" || !strings.Contains(f.stdout.String(), "cleanup scheduled") {
+		t.Fatalf("diagnostic failure changed scheduled work: %+v, %s", state, f.stdout.String())
+	}
+	hostStateStore(t, f)
+}
+
+func TestCleanupSpawnFailurePreservesSecondaryErrors(t *testing.T) {
+	for _, failure := range []string{"diagnostic", "checkpoint"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newHostFixture(t, "")
+			if err := f.run(t, "add", "topic", "-b"); err != nil {
+				t.Fatal(err)
+			}
+			want := fmt.Errorf("spawn failed")
+			f.mux.caller = true
+			f.app.Spawner = cleanupSpawnFunc(func(_ context.Context, launch CleanupLaunch) error {
+				if failure == "diagnostic" {
+					if err := launch.Stderr.Close(); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					lock := filepath.Join(f.state, launch.Command.RepoID, "lock")
+					if err := os.Rename(lock, lock+"-old"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return want
+			})
+			err := f.run(t, "remove", "topic", "--keep-branch")
+			if !errors.Is(err, want) || !strings.Contains(err.Error(), "cleanup "+failure) {
+				t.Fatalf("lost primary or secondary failure: %v", err)
+			}
+			if failure == "diagnostic" && !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("lost diagnostic cause: %v", err)
+			}
+			if state := f.load(t, "topic"); state.Removal.WorktreeRemoved || f.mux.window == "" {
+				t.Fatal("failed spawn removed resources")
+			}
+		})
+	}
+}
+
 func TestCleanupConcreteSpawnerRejectsBadOrMissingHandshake(t *testing.T) {
 	for _, mode := range []string{"bad-ready", "no-ready"} {
 		t.Run(mode, func(t *testing.T) {
@@ -368,6 +472,26 @@ func TestCleanupWorkerReadinessPrecedesLockHandoff(t *testing.T) {
 	if state := f.load(t, "topic"); state.Stage != "removed" {
 		t.Fatal("worker did not finish after lock handoff")
 	}
+}
+
+func TestCleanupWorkerReadinessCloseFailureDoesNotCancelArmedJob(t *testing.T) {
+	f := newHostFixture(t, "")
+	store, state, command := queuedCleanup(t, f)
+	want := fmt.Errorf("readiness close failed")
+	ready := cleanupReadyCloser{
+		cleanupReadyFunc: func(data []byte) (int, error) {
+			armCleanup(t, store, &state)
+			return len(data), nil
+		},
+		err: want,
+	}
+	if err := f.app.RunCleanup(context.Background(), command, ready); !errors.Is(err, want) {
+		t.Fatalf("readiness close error = %v, want %v", err, want)
+	}
+	if state := f.load(t, "topic"); state.Stage != "removed" || state.Removal.Job.Status != "complete" {
+		t.Fatalf("readiness close failure cancelled armed cleanup: %+v", state)
+	}
+	hostStateStore(t, f)
 }
 
 func TestCleanupExecutionOutlivesHandoffLease(t *testing.T) {
@@ -459,8 +583,8 @@ func TestCleanupSocketLoss(t *testing.T) {
 			t.Cleanup(func() {
 				cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				runner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
-				oldRunner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
+				_, _ = runner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
+				_, _ = oldRunner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
 			})
 			if kind == "rebound" {
 				if _, err := runner.Run(ctx, Process{Name: "tmux", Args: []string{"new-session", "-d", "-s", "replacement", "--", "sleep", "60"}}); err != nil {
@@ -493,7 +617,7 @@ func TestCleanupSocketLoss(t *testing.T) {
 			if _, err := os.Stat(state.Path); err != nil {
 				t.Fatal("worktree disappeared", err)
 			}
-			for retry := 0; retry < 3; retry++ {
+			for range 3 {
 				if err := f.run(t, "remove", "topic", "--keep-branch"); err == nil {
 					t.Fatal("public retry discarded the unreachable captured server")
 				}
@@ -555,7 +679,9 @@ func TestCleanupSocketLossBeforeCapture(t *testing.T) {
 				if err := store.save(state); err != nil {
 					t.Fatal(err)
 				}
-				store.unlock()
+				if err := store.unlock(); err != nil {
+					t.Fatal(err)
+				}
 			}
 			alias := filepath.Join(filepath.Dir(runner.socket), "old.sock")
 			if err := os.Rename(runner.socket, alias); err != nil {
@@ -565,9 +691,9 @@ func TestCleanupSocketLossBeforeCapture(t *testing.T) {
 			t.Cleanup(func() {
 				cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				oldRunner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
+				_, _ = oldRunner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
 			})
-			for attempt := 0; attempt < 3; attempt++ {
+			for range 3 {
 				if err := f.run(t, "remove", "topic", "--keep-branch"); err == nil || !strings.Contains(err.Error(), "restore") {
 					t.Fatalf("missing initial socket was treated as absence: %v", err)
 				}
@@ -613,7 +739,9 @@ func TestCleanupLegacyFailedSocketLoss(t *testing.T) {
 	if err := store.save(state); err != nil {
 		t.Fatal(err)
 	}
-	store.unlock()
+	if err := store.unlock(); err != nil {
+		t.Fatal(err)
+	}
 	alias := filepath.Join(filepath.Dir(runner.socket), "old.sock")
 	if err := os.Rename(runner.socket, alias); err != nil {
 		t.Fatal(err)
@@ -622,10 +750,10 @@ func TestCleanupLegacyFailedSocketLoss(t *testing.T) {
 	t.Cleanup(func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		oldRunner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
+		_, _ = oldRunner.Run(cleanup, Process{Name: "tmux", Args: []string{"kill-server"}})
 	})
 	f.app.Mux = mux
-	for retry := 0; retry < 3; retry++ {
+	for range 3 {
 		if err := f.run(t, "remove", "topic", "--keep-branch"); err == nil || !strings.Contains(err.Error(), "restore") {
 			t.Fatalf("legacy failed job became an empty capture: %v", err)
 		}
@@ -698,7 +826,9 @@ func TestCleanupBrokenStdoutDoesNotArmWorker(t *testing.T) {
 	if err := store.save(state); err != nil {
 		t.Fatal(err)
 	}
-	store.unlock()
+	if err := store.unlock(); err != nil {
+		t.Fatal(err)
+	}
 	pane, err := runner.Run(ctx, Process{Name: "tmux", Args: []string{"list-panes", "-t", window, "-F", "#{pane_id}"}})
 	if err != nil {
 		t.Fatal(err)
@@ -711,8 +841,14 @@ func TestCleanupBrokenStdoutDoesNotArmWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	read.Close()
-	defer write.Close()
+	if err := read.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := write.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	pidPath := filepath.Join(f.home, "broken-pipe-worker")
 	cmd := exec.CommandContext(ctx, executable, "workmux", "remove", "--keep-branch")
 	cmd.Dir = state.Path
@@ -800,7 +936,9 @@ func TestCleanupWorkerRejectsChangedIdentityRefAndToken(t *testing.T) {
 				case "ignored":
 					hostWrite(t, filepath.Join(state.Path, ".env"), "SECRET=value")
 				}
-				store.unlock()
+				if err := store.unlock(); err != nil {
+					t.Fatal(err)
+				}
 				return len(data), nil
 			})
 			if err := f.app.RunCleanup(context.Background(), command, ready); err == nil {
@@ -886,7 +1024,9 @@ func TestCleanupExpiredMissingWorkerCanBeRetried(t *testing.T) {
 	if err := store.save(state); err != nil {
 		t.Fatal(err)
 	}
-	store.unlock()
+	if err := store.unlock(); err != nil {
+		t.Fatal(err)
+	}
 	f.mux.caller = false
 	if err := f.run(t, "remove", "topic"); err != nil {
 		t.Fatal("expired handoff could not be retried", err)
@@ -937,7 +1077,9 @@ func TestCleanupExternalUsesSavedSocketWithoutTMUX(t *testing.T) {
 	if err := store.save(w); err != nil {
 		t.Fatal(err)
 	}
-	store.unlock()
+	if err := store.unlock(); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("TMUX", "")
 	t.Setenv("TMUX_PANE", "")
 	f.app.Mux = Tmux{Runner: ExecRunner{}}
@@ -989,7 +1131,9 @@ func TestCleanupActualSelfWindowProcess(t *testing.T) {
 			if err := store.save(w); err != nil {
 				t.Fatal(err)
 			}
-			store.unlock()
+			if err := store.unlock(); err != nil {
+				t.Fatal(err)
+			}
 			pidData, err := runner.Run(ctx, Process{Name: "tmux", Args: []string{"list-panes", "-t", window, "-F", "#{pane_pid}"}})
 			if err != nil {
 				t.Fatal(err)

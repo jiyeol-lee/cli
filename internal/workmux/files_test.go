@@ -348,7 +348,11 @@ func TestApplyFilesRejectsSpecialFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { listener.Close() })
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	writeProvisionFixture(t, root, "new/valid", "valid", 0600)
 	for _, files := range []FilesConfig{
 		{Copy: []string{"new/valid", "socket"}},
@@ -372,7 +376,11 @@ func TestApplyFilesUnreadableSource(t *testing.T) {
 	if err := os.Chmod(path, 0000); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chmod(path, 0600) })
+	t.Cleanup(func() {
+		if err := os.Chmod(path, 0600); err != nil {
+			t.Error(err)
+		}
+	})
 	before := provisionSnapshot(t, destination)
 	if err := ApplyFiles(context.Background(), root, destination, FilesConfig{Copy: []string{"new/valid", "private"}}, nil); err == nil || !errors.Is(err, fs.ErrPermission) {
 		t.Fatalf("unreadable file error = %v", err)
@@ -504,12 +512,12 @@ func TestProvisionRefusesChangesAfterPreflight(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer source.Close()
+			defer func() { _ = source.Close() }()
 			target, _, err := openProvisionRoot(destination, true)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer target.Close()
+			defer func() { _ = target.Close() }()
 			plan, err := scanProvisionSource(context.Background(), source, "private/value")
 			if err != nil {
 				t.Fatal(err)

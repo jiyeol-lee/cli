@@ -386,7 +386,11 @@ func TestPrivateWorkmuxDispatchUsesCapturedPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Close()
+	t.Cleanup(func() {
+		if err := lock.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}
@@ -409,14 +413,18 @@ func TestPrivateWorkmuxDispatchUsesCapturedPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer readyRead.Close()
-	defer readyWrite.Close()
+	t.Cleanup(func() {
+		if err := readyRead.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	defer func() { _ = readyWrite.Close() }()
 	inputRead, inputWrite, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer inputRead.Close()
-	defer inputWrite.Close()
+	defer func() { _ = inputRead.Close() }()
+	defer func() { _ = inputWrite.Close() }()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -444,16 +452,23 @@ func TestPrivateWorkmuxDispatchUsesCapturedPaths(t *testing.T) {
 	}
 	defer func() {
 		if cmd.ProcessState == nil {
-			cmd.Process.Kill()
-			cmd.Wait()
+			// Reap the subprocess after a test failure; a killed exit is expected.
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
 		}
 	}()
-	readyWrite.Close()
-	inputRead.Close()
+	if err := readyWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := inputRead.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := json.NewEncoder(inputWrite).Encode(paths); err != nil {
 		t.Fatal(err)
 	}
-	inputWrite.Close()
+	if err := inputWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := readyRead.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,9 +52,9 @@ type dependencies struct {
 	stdout            io.Writer
 }
 
-func runWithDependencies(ctx context.Context, args []string, deps dependencies) error {
+func runWithDependencies(ctx context.Context, args []string, deps dependencies) (runErr error) {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: cli <voca|gcal|memory|workmux> ...")
+		return fmt.Errorf("usage: cli <voca|gcal|memory|workmux> <command> [arguments]")
 	}
 	var calendarCommand gcal.Command
 	var memoryCommand memory.Command
@@ -125,7 +126,11 @@ func runWithDependencies(ctx context.Context, args []string, deps dependencies) 
 		if err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() {
+			if err := db.Close(); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("close database: %w", err))
+			}
+		}()
 		if err := voca.Migrate(ctx, db); err != nil {
 			return err
 		}
@@ -148,7 +153,11 @@ func runWithDependencies(ctx context.Context, args []string, deps dependencies) 
 		if err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() {
+			if err := db.Close(); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("close database: %w", err))
+			}
+		}()
 		if err := memory.Migrate(ctx, db); err != nil {
 			return err
 		}

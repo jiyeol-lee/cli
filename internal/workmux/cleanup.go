@@ -191,21 +191,27 @@ func openCleanupLog(store *stateStore, id, token string) (*os.File, error) {
 	}
 	file := os.NewFile(uintptr(fd), path)
 	if err := privateFile(file, path); err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, err
 	}
 	return file, nil
 }
 
-func cleanupDiagnostic(file *os.File, phase string) {
+func cleanupDiagnostic(file *os.File, phase string) error {
 	// Only fixed phase names belong here, never subprocess output or hook/config contents.
-	if file != nil {
-		fmt.Fprintln(file, phase)
-		file.Sync()
+	if file == nil {
+		return nil
 	}
+	if _, err := fmt.Fprintln(file, phase); err != nil {
+		return fmt.Errorf("write cleanup diagnostic: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync cleanup diagnostic: %w", err)
+	}
+	return nil
 }
 
-func (app *App) cleanup(ctx context.Context, g gitHost, repo gitRepository, store *stateStore, state *workspaceState, merged bool) error {
+func (app *App) cleanup(ctx context.Context, g gitHost, repo gitRepository, store *stateStore, state *workspaceState, merged bool) (resultErr error) {
 	removal := state.Removal
 	if err := verifyCleanupIdentity(state.Workspace, removal.Identity, removal.WorktreeRemoved); err != nil {
 		return err
@@ -233,16 +239,30 @@ func (app *App) cleanup(ctx context.Context, g gitHost, repo gitRepository, stor
 	log, err := openCleanupLog(store, state.ID, token)
 	if err != nil {
 		job.Status = "failed"
-		store.save(*state)
+		if saveErr := store.save(*state); saveErr != nil {
+			return errors.Join(err, fmt.Errorf("save failed cleanup checkpoint: %w", saveErr))
+		}
 		return err
 	}
-	defer log.Close()
-	cleanupDiagnostic(log, "queued")
+	var diagnosticErr error
+	// Report the first diagnostic failure without cancelling durable cleanup work.
+	diagnose := func(phase string) {
+		if diagnosticErr == nil {
+			diagnosticErr = cleanupDiagnostic(log, phase)
+		}
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, diagnosticErr)
+		if err := log.Close(); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("close cleanup diagnostic: %w", err))
+		}
+	}()
+	diagnose("queued")
 	fail := func(phase string, err error) error {
 		job.Status = "failed"
-		cleanupDiagnostic(log, phase)
+		diagnose(phase)
 		if saveErr := store.save(*state); saveErr != nil {
-			return fmt.Errorf("cleanup failed and its checkpoint could not be saved: %w", saveErr)
+			err = errors.Join(err, fmt.Errorf("save failed cleanup checkpoint: %w", saveErr))
 		}
 		return fmt.Errorf("cleanup incomplete; retry remove; diagnostics: %s: %w", log.Name(), err)
 	}
@@ -267,7 +287,7 @@ func (app *App) cleanup(ctx context.Context, g gitHost, repo gitRepository, stor
 		if err := store.save(*state); err != nil {
 			return fail("handoff_failed", err)
 		}
-		cleanupDiagnostic(log, "armed")
+		diagnose("armed")
 		app.cleanupScheduled = true
 		return store.unlock()
 	}
@@ -278,7 +298,7 @@ func (app *App) cleanup(ctx context.Context, g gitHost, repo gitRepository, stor
 	if phase, err := app.executeCleanup(ctx, g, repo, store, state); err != nil {
 		return fail(phase, err)
 	}
-	cleanupDiagnostic(log, "complete")
+	diagnose("complete")
 	return nil
 }
 
@@ -443,19 +463,19 @@ func (ExecCleanupSpawner) Start(ctx context.Context, launch CleanupLaunch) error
 	if err != nil {
 		return err
 	}
-	defer readyRead.Close()
-	defer readyWrite.Close()
+	defer func() { _ = readyRead.Close() }()
+	defer func() { _ = readyWrite.Close() }()
 	inputRead, inputWrite, err := os.Pipe()
 	if err != nil {
 		return err
 	}
-	defer inputRead.Close()
-	defer inputWrite.Close()
+	defer func() { _ = inputRead.Close() }()
+	defer func() { _ = inputWrite.Close() }()
 	null, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
-	defer null.Close()
+	defer func() { _ = null.Close() }()
 	cmd := exec.Command(executable, "workmux", "_cleanup", launch.Command.RepoID, launch.Command.ID, launch.Command.Token)
 	cmd.Dir = launch.Root
 	cmd.Env = append(os.Environ(), "CLI_WORKMUX_CLEANUP_PROTOCOL=1")
@@ -465,17 +485,22 @@ func (ExecCleanupSpawner) Start(ctx context.Context, launch CleanupLaunch) error
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start detached cleanup: %w", err)
 	}
-	readyWrite.Close()
-	inputRead.Close()
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	result := make(chan error, 1)
 	go func() {
+		if err := errors.Join(readyWrite.Close(), inputRead.Close()); err != nil {
+			result <- err
+			return
+		}
 		if err := json.NewEncoder(inputWrite).Encode(launch.Paths); err != nil {
 			result <- err
 			return
 		}
-		inputWrite.Close()
+		if err := inputWrite.Close(); err != nil {
+			result <- err
+			return
+		}
 		line, err := bufio.NewReader(io.LimitReader(readyRead, 80)).ReadString('\n')
 		if err == nil && line != "ready "+launch.Command.Token+"\n" {
 			err = fmt.Errorf("invalid cleanup readiness acknowledgement")
@@ -490,9 +515,10 @@ func (ExecCleanupSpawner) Start(ctx context.Context, launch CleanupLaunch) error
 		err = ctx.Err()
 	}
 	if err != nil {
-		cmd.Process.Kill()
-		inputWrite.Close()
-		readyRead.Close()
+		// The failed helper may already have exited or closed its pipes.
+		_ = cmd.Process.Kill()
+		_ = inputWrite.Close()
+		_ = readyRead.Close()
 		<-done
 		return fmt.Errorf("cleanup readiness handshake failed: %w", err)
 	}
@@ -523,8 +549,8 @@ func RunCleanupProcess(ctx context.Context, command CleanupCommand, factory func
 	}
 	ready := os.NewFile(3, "cleanup-ready")
 	input := os.NewFile(4, "cleanup-input")
-	defer ready.Close()
-	defer input.Close()
+	defer func() { _ = ready.Close() }()
+	defer func() { _ = input.Close() }()
 	var paths CleanupPaths
 	decoded := make(chan error, 1)
 	go func() {
@@ -551,7 +577,7 @@ func RunCleanupProcess(ctx context.Context, command CleanupCommand, factory func
 	case <-readCtx.Done():
 		return fmt.Errorf("private cleanup handoff timed out")
 	}
-	input.Close()
+	_ = input.Close()
 	if err := validateCleanupPaths(paths); err != nil {
 		return err
 	}
@@ -563,7 +589,7 @@ func RunCleanupProcess(ctx context.Context, command CleanupCommand, factory func
 	return nil
 }
 
-func (app App) RunCleanup(ctx context.Context, command CleanupCommand, ready io.Writer) error {
+func (app App) RunCleanup(ctx context.Context, command CleanupCommand, ready io.Writer) (resultErr error) {
 	if _, err := ParseCleanupCommand([]string{"_cleanup", command.RepoID, command.ID, command.Token}); err != nil {
 		return err
 	}
@@ -596,24 +622,38 @@ func (app App) RunCleanup(ctx context.Context, command CleanupCommand, ready io.
 	if err != nil {
 		return err
 	}
-	defer log.Close()
+	var diagnosticErr, readyErr error
+	// Once ready, the parent may arm the job. Report I/O failures after finishing it.
+	diagnose := func(phase string) {
+		if diagnosticErr == nil {
+			diagnosticErr = cleanupDiagnostic(log, phase)
+		}
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, diagnosticErr, readyErr)
+		if err := log.Close(); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("close cleanup diagnostic: %w", err))
+		}
+	}()
 	job := state.Removal.Job
 	if job.Status != "queued" || !cleanupActive(job) {
-		cleanupDiagnostic(log, "stale_handoff")
+		diagnose("stale_handoff")
 		return fmt.Errorf("cleanup is not queued or its handoff expired")
 	}
 	if err := verifyCleanupIdentity(state.Workspace, state.Removal.Identity, state.Removal.WorktreeRemoved); err != nil {
-		cleanupDiagnostic(log, "identity_failed")
+		diagnose("identity_failed")
 		return err
 	}
 	if _, err := fmt.Fprintf(ready, "ready %s\n", command.Token); err != nil {
-		cleanupDiagnostic(log, "readiness_failed")
+		diagnose("readiness_failed")
 		return err
 	}
 	if closer, ok := ready.(io.Closer); ok {
-		closer.Close()
+		if err := closer.Close(); err != nil {
+			readyErr = fmt.Errorf("close cleanup readiness channel: %w", err)
+		}
 	}
-	cleanupDiagnostic(log, "worker_ready")
+	diagnose("worker_ready")
 	deadline := time.Unix(0, job.Deadline)
 	if maximum := time.Now().Add(cleanupLease); deadline.After(maximum) {
 		deadline = maximum
@@ -622,7 +662,7 @@ func (app App) RunCleanup(ctx context.Context, command CleanupCommand, ready io.
 	defer cancel()
 	for {
 		if err := handoffCtx.Err(); err != nil {
-			cleanupDiagnostic(log, "lock_timeout")
+			diagnose("lock_timeout")
 			return err
 		}
 		store, err = lockState(app.StateDir, repo)
@@ -630,39 +670,45 @@ func (app App) RunCleanup(ctx context.Context, command CleanupCommand, ready io.
 			break
 		}
 		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
-			cleanupDiagnostic(log, "lock_failed")
+			diagnose("lock_failed")
 			return err
 		}
 		if err := cleanupPause(handoffCtx, 25*time.Millisecond); err != nil {
-			cleanupDiagnostic(log, "lock_timeout")
+			diagnose("lock_timeout")
 			return err
 		}
 	}
-	defer store.unlock()
+	defer func() {
+		if err := store.unlock(); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("release repository lock: %w", err))
+		}
+	}()
 	state, err = readState(filepath.Join(store.dir, command.ID+".json"))
 	if err != nil {
-		cleanupDiagnostic(log, "state_failed")
+		diagnose("state_failed")
 		return err
 	}
 	if err := store.validate(state); err != nil {
-		cleanupDiagnostic(log, "state_failed")
+		diagnose("state_failed")
 		return err
 	}
 	if state.Removal == nil || state.Removal.Job == nil || state.Removal.Job.Token != command.Token || state.Removal.Job.Status != "armed" || !cleanupActive(state.Removal.Job) || handoffCtx.Err() != nil {
-		cleanupDiagnostic(log, "stale_handoff")
+		diagnose("stale_handoff")
 		return fmt.Errorf("cleanup handoff was cancelled, replaced, or expired")
 	}
 	job = state.Removal.Job
 	job.Status = "running"
 	if err := store.save(state); err != nil {
-		cleanupDiagnostic(log, "checkpoint_failed")
+		diagnose("checkpoint_failed")
 		return err
 	}
 	cancel()
 	fail := func(phase string, err error) error {
-		cleanupDiagnostic(log, phase)
+		diagnose(phase)
 		job.Status = "failed"
-		store.save(state)
+		if saveErr := store.save(state); saveErr != nil {
+			return errors.Join(err, fmt.Errorf("save failed cleanup checkpoint: %w", saveErr))
+		}
 		return err
 	}
 	if err := verifyCleanupIdentity(state.Workspace, state.Removal.Identity, state.Removal.WorktreeRemoved); err != nil {
@@ -682,6 +728,6 @@ func (app App) RunCleanup(ctx context.Context, command CleanupCommand, ready io.
 	if phase, err := app.executeCleanup(ctx, g, found, store, &state); err != nil {
 		return fail(phase, err)
 	}
-	cleanupDiagnostic(log, "complete")
+	diagnose("complete")
 	return nil
 }
