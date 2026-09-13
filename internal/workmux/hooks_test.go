@@ -3,11 +3,14 @@ package workmux
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestHostHooksPassCommandAndEnvironmentWithoutInterpolation(t *testing.T) {
@@ -51,19 +54,40 @@ func TestHostHooksStopAtFirstFailure(t *testing.T) {
 	}
 }
 
-func TestHostSandboxNeverFallsBackForHooksOrPanes(t *testing.T) {
+func TestHostHooksKeepExitStatusWithoutPaneFallback(t *testing.T) {
+	for _, test := range []struct {
+		command string
+		status  int
+	}{{"exit 0", 0}, {"false", 1}, {"exit 7", 7}, {"exec true", 0}, {"exec /missing-workmux-executable", 127}} {
+		t.Run(test.command, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			w := tmuxTestWorkspace()
+			w.Path = t.TempDir()
+			var stdout bytes.Buffer
+			app := App{Runner: ExecRunner{}, Stdout: &stdout, Stdin: strings.NewReader("printf unexpected-shell\nexit 0\n")}
+			err := app.hooks(ctx, w, "pre_remove", []string{test.command})
+			var exited *exec.ExitError
+			if test.status == 0 && err != nil || test.status != 0 && (!errors.As(err, &exited) || exited.ExitCode() != test.status) || stdout.Len() != 0 {
+				t.Fatalf("hook lost status %d or started a shell: %v, %q", test.status, err, &stdout)
+			}
+		})
+	}
+}
+
+func TestSandboxOnlyWrapsAgentPanesAndHooksStayHost(t *testing.T) {
 	w := tmuxTestWorkspace()
 	w.Config.Sandbox.Enabled = true
-	app := App{}
-	if err := app.hooks(context.Background(), w, "pre_merge", []string{"true"}); err == nil {
-		t.Fatal("missing sandbox did not block hooks")
+	w.Path = t.TempDir()
+	app := App{Runner: ExecRunner{}}
+	if err := app.hooks(context.Background(), w, "pre_merge", []string{"true"}); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := app.paneCommands(w, []Pane{{Command: "true"}}); err == nil {
+	if _, err := app.paneCommands(context.Background(), w, []Pane{{Command: "opencode"}}); err == nil {
 		t.Fatal("missing sandbox did not block panes")
 	}
-	w.Config.Sandbox.Enabled = false
-	commands, err := app.paneCommands(w, []Pane{{}, {Command: "echo ok"}})
-	if err != nil || !reflect.DeepEqual(commands, [][]string{nil, {"bash", "-c", "echo ok"}}) {
+	commands, err := app.paneCommands(context.Background(), w, []Pane{{}, {Command: "echo opencode"}, {Command: "nvim"}})
+	if err != nil || !reflect.DeepEqual(commands, [][]string{nil, {"echo opencode"}, {"nvim"}}) {
 		t.Fatalf("host panes = %q, %v", commands, err)
 	}
 }

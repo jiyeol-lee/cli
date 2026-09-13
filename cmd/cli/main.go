@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -22,12 +23,57 @@ import (
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := commandSignalContext()
 	defer stop()
-	if err := run(ctx, os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "cli:", err)
-		os.Exit(1)
+	err := run(ctx, os.Args[1:])
+	if ctx.Err() != nil && !errors.Is(err, context.Cause(ctx)) {
+		err = errors.Join(err, context.Cause(ctx))
 	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cli:", err)
+		os.Exit(commandExitCode(os.Args[1:], err))
+	}
+}
+
+func commandSignalContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case received := <-signals:
+			if received == syscall.SIGTERM {
+				cancel(workmux.ErrTerminate)
+			} else {
+				cancel(workmux.ErrInterrupt)
+			}
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() { signal.Stop(signals); cancel(context.Canceled) }
+}
+
+func commandExitCode(args []string, err error) int {
+	if len(args) >= 3 && args[0] == "workmux" && args[1] == "sandbox" && args[2] == "shell" {
+		if errors.Is(err, workmux.ErrTerminate) {
+			return 143
+		}
+		if errors.Is(err, workmux.ErrInterrupt) {
+			return 130
+		}
+		if exit, ok := errors.AsType[*exec.ExitError](err); ok {
+			if exit.ExitCode() > 0 {
+				return exit.ExitCode()
+			}
+			if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				return 128 + int(status.Signal())
+			}
+		}
+		if errors.Is(err, context.Canceled) {
+			return 130
+		}
+	}
+	return 1
 }
 
 func run(ctx context.Context, args []string) error {

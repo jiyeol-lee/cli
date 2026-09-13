@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"os"
@@ -47,6 +48,7 @@ func TestSandboxProtectedMounts(t *testing.T) {
 		filepath.Join(identity.Admin, "objects", "info"): true, filepath.Join(identity.Admin, "modules"): true,
 		filepath.Join(identity.Admin, "worktrees"): true,
 		"/tmp/.local/share/opencode":               false, "/tmp/.config/opencode": true,
+		"/tmp/.local/state/opencode": false,
 	}
 	if len(plan.Mounts) != len(want) {
 		t.Fatalf("mount count = %d, want %d: %+v", len(plan.Mounts), len(want), plan.Mounts)
@@ -60,7 +62,7 @@ func TestSandboxProtectedMounts(t *testing.T) {
 			if !sandboxWithin(c.StateDir, mount.Source) || mount.Source == mount.Target || !mount.ReadOnly {
 				t.Fatalf("config is not a private read-only snapshot: %+v", mount)
 			}
-		} else if mount.Target != "/tmp/.local/share/opencode" && mount.Target != "/tmp/.config/opencode" && mount.Source != mount.Target {
+		} else if mount.Target != "/tmp/.local/share/opencode" && mount.Target != "/tmp/.local/state/opencode" && mount.Target != "/tmp/.config/opencode" && mount.Source != mount.Target {
 			t.Fatalf("repository mount moved path: %+v", mount)
 		}
 		for _, later := range plan.Mounts[i+1:] {
@@ -105,16 +107,22 @@ func TestSandboxCredentialsAndIdentity(t *testing.T) {
 			t.Setenv("INHERITED_API_KEY", "must-not-be-forwarded")
 			t.Setenv("GIT_AUTHOR_NAME", "must-not-be-forwarded")
 			data, config := filepath.Join(c.HomeDir, ".local", "share"), filepath.Join(c.HomeDir, ".config")
+			state := filepath.Join(c.HomeDir, ".local", "state")
 			if xdg {
+				state = filepath.Join(c.HomeDir, "custom state")
 				data, config = filepath.Join(c.HomeDir, "custom data"), filepath.Join(c.HomeDir, "custom config")
 				sandboxTestWrite(t, filepath.Join(config, "opencode", ".gitignore"), "")
 				c.Getenv = func(key string) string {
-					return map[string]string{"XDG_DATA_HOME": data, "XDG_CONFIG_HOME": config}[key]
+					return map[string]string{"XDG_DATA_HOME": data, "XDG_CONFIG_HOME": config, "XDG_STATE_HOME": state}[key]
 				}
 			}
 			plan := sandboxTestPlan(t, c, w, engine.image)
 			for _, mount := range plan.Mounts {
 				switch mount.Target {
+				case "/tmp/.local/state/opencode":
+					if mount.Source != filepath.Join(state, "opencode") || mount.ReadOnly {
+						t.Fatalf("state mount = %+v", mount)
+					}
 				case "/tmp/.local/share/opencode":
 					if mount.Source != filepath.Join(data, "opencode") || mount.ReadOnly {
 						t.Fatalf("data mount = %+v", mount)
@@ -128,7 +136,7 @@ func TestSandboxCredentialsAndIdentity(t *testing.T) {
 					t.Fatalf("broad credential mount: %+v", mount)
 				}
 			}
-			for _, path := range []string{filepath.Join(data, "opencode"), filepath.Join(config, "opencode")} {
+			for _, path := range []string{filepath.Join(data, "opencode"), filepath.Join(config, "opencode"), filepath.Join(state, "opencode")} {
 				info, err := os.Stat(path)
 				if err != nil || info.Mode().Perm() != 0700 {
 					t.Fatalf("credential directory permissions: %v %v", info, err)
@@ -141,6 +149,104 @@ func TestSandboxCredentialsAndIdentity(t *testing.T) {
 			}
 			if !slices.Equal(plan.Env, want) {
 				t.Fatalf("guest environment = %q, want %q", plan.Env, want)
+			}
+		})
+	}
+}
+
+func TestSandboxOpenCodeStatePathIdentity(t *testing.T) {
+	c, w, engine := sandboxTestFixture(t)
+	initial := sandboxTestPlan(t, c, w, engine.image)
+	values := map[string]string{
+		"XDG_DATA_HOME":   filepath.Join(c.HomeDir, ".local", "share"),
+		"XDG_CONFIG_HOME": filepath.Join(c.HomeDir, ".config"),
+		"XDG_STATE_HOME":  filepath.Join(c.HomeDir, ".local", "state"),
+		"XDG_CACHE_HOME":  "relative-cache-is-not-mounted",
+	}
+	c.Getenv = func(key string) string { return values[key] }
+	if plan := sandboxTestPlan(t, c, w, engine.image); plan.Fingerprint != initial.Fingerprint {
+		t.Fatal("explicit default paths or unmounted cache changed mount identity")
+	}
+	values["XDG_STATE_HOME"] = filepath.Join(c.HomeDir, "other-state")
+	if plan := sandboxTestPlan(t, c, w, engine.image); plan.Fingerprint == initial.Fingerprint {
+		t.Fatal("changed state path did not change mount identity")
+	}
+}
+
+func TestSandboxOpenCodeStateSafety(t *testing.T) {
+	for _, name := range []string{"relative", "unclean", "comma", "root", "symlink", "ancestor symlink", "data same", "data child", "config same", "config parent", "private same", "private child", "private parent", "repo", "siblings", "missing inspect"} {
+		t.Run(name, func(t *testing.T) {
+			c, w, _ := sandboxTestFixture(t)
+			base := filepath.Join(c.HomeDir, "state")
+			values := map[string]string{"XDG_STATE_HOME": base}
+			c.Getenv = func(key string) string { return values[key] }
+			state := filepath.Join(base, "opencode")
+			switch name {
+			case "relative":
+				values["XDG_STATE_HOME"] = "relative"
+			case "unclean":
+				values["XDG_STATE_HOME"] = base + "/../state"
+			case "comma":
+				values["XDG_STATE_HOME"] = base + ",bad"
+			case "root":
+				values["XDG_STATE_HOME"] = "/"
+			case "symlink", "ancestor symlink":
+				link := base
+				if name == "symlink" {
+					link = state
+				}
+				if err := os.MkdirAll(filepath.Dir(link), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(c.StateDir, link); err != nil {
+					t.Fatal(err)
+				}
+			case "data same":
+				values["XDG_DATA_HOME"] = base
+			case "data child":
+				values["XDG_DATA_HOME"] = state
+			case "config same":
+				w.Config.Sandbox.OpenCodeConfigDir = state
+			case "config parent":
+				w.Config.Sandbox.OpenCodeConfigDir = base
+			case "private same":
+				c.StateDir = state
+			case "private child":
+				c.StateDir = filepath.Join(state, "private")
+			case "private parent":
+				c.StateDir = base
+			case "repo":
+				values["XDG_STATE_HOME"] = w.Root
+			case "siblings":
+				c.StateDir = filepath.Join(base, "cli", "workmux")
+			}
+			var plan sandboxMountPlan
+			err := c.credentialMounts(t.Context(), w, &plan, name != "missing inspect")
+			if name != "siblings" {
+				if err == nil {
+					t.Fatal("accepted unsafe or missing state")
+				}
+				if name == "missing inspect" {
+					if _, err := os.Lstat(state); !os.IsNotExist(err) {
+						t.Fatalf("inspection created state: %v", err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, mount := range plan.Mounts {
+				if sandboxOverlap(mount.Source, c.StateDir) || strings.Contains(mount.Target, ".cache") {
+					t.Fatalf("private state or cache mounted: %+v", mount)
+				}
+				if mount.Target == "/tmp/.local/state/opencode" {
+					found = mount.Source == state && !mount.ReadOnly
+				}
+			}
+			if !found {
+				t.Fatal("missing writable state mount")
 			}
 		})
 	}
@@ -185,12 +291,16 @@ func TestSandboxSeparateCommonDirectory(t *testing.T) {
 	sandboxTestWrite(t, filepath.Join(w.Root, ".git"), "gitdir: "+common+"\n")
 	sandboxTestWrite(t, identity.Pointer, "gitdir: "+filepath.Join(common, "worktrees", filepath.Base(identity.Admin))+"\n")
 	plan := sandboxTestPlan(t, c, w, engine.image)
-	for _, mount := range plan.Mounts {
-		if mount.Target == common && mount.ReadOnly {
-			return
+	for _, path := range []string{w.Root, common} {
+		if !slices.ContainsFunc(plan.Mounts, func(m sandboxMount) bool { return m.Target == path && m.Source == path && m.ReadOnly }) {
+			t.Fatalf("explicit main/common root not read-only: %s", path)
 		}
 	}
-	t.Fatal("separate common directory is not read-only")
+	for _, mount := range plan.Mounts {
+		if mount.Target == filepath.Dir(common) {
+			t.Fatal("separate gitdir exposed a guessed parent worktree")
+		}
+	}
 }
 
 func TestSandboxPointerDoesNotCleanBeforeResolving(t *testing.T) {
@@ -282,39 +392,57 @@ func TestSandboxRejectsLinkedPolicyAndInvalidIdentity(t *testing.T) {
 	}
 }
 
-func TestSandboxRejectsUnsupportedRepositoryLayouts(t *testing.T) {
-	for _, layout := range []string{"nested pointer", "nested repository", "submodule config", "module admin", "include", "conditional include", "glob include", "missing include"} {
+func TestSandboxConfigIncludes(t *testing.T) {
+	for _, layout := range []string{"include", "conditional include", "glob include", "missing include", "symlink include", "hardlink include", "nested include"} {
 		t.Run(layout, func(t *testing.T) {
 			c, w, engine := sandboxTestFixture(t)
-			switch layout {
-			case "nested pointer":
-				sandboxTestWrite(t, filepath.Join(w.Path, "vendor", "module", ".git"), "gitdir: /outside\n")
-			case "nested repository":
-				if err := os.MkdirAll(filepath.Join(w.Path, "nested", ".git"), 0700); err != nil {
+			key, value := "include.path", filepath.Join(w.Path, "included")
+			if layout == "conditional include" {
+				key = "includeIf.gitdir:/never-matches/.path"
+			}
+			if layout == "glob include" {
+				value += "*"
+			}
+			if layout != "missing include" {
+				sandboxTestWrite(t, value, "[user]\nname = Included\n")
+			}
+			if layout == "nested include" {
+				sandboxTestWrite(t, filepath.Join(w.Path, "second"), "[user]\nemail = included@example.invalid\n")
+				sandboxTestGit(t, w.Path, "config", "--file", value, "include.path", "second")
+			}
+			if layout == "symlink include" || layout == "hardlink include" {
+				target := value + "-target"
+				if err := os.Rename(value, target); err != nil {
 					t.Fatal(err)
 				}
-			case "submodule config":
-				sandboxTestWrite(t, filepath.Join(w.Path, ".gitmodules"), "")
-			case "module admin":
-				sandboxTestWrite(t, filepath.Join(w.CommonDir, "modules", "module", "config"), "")
-			default:
-				key, value := "include.path", filepath.Join(w.Path, "included")
-				if layout == "conditional include" {
-					key = "includeIf.gitdir:/never-matches/.path"
+				link := os.Link
+				if layout == "symlink include" {
+					link = os.Symlink
 				}
-				if layout == "glob include" {
-					value += "*"
+				if err := link(target, value); err != nil {
+					t.Fatal(err)
 				}
-				if layout == "missing include" {
-					value += "-missing"
-				} else {
-					sandboxTestWrite(t, value, "[user]\nname = Included\n")
-				}
-				sandboxTestGit(t, w.Root, "config", "--file", filepath.Join(w.CommonDir, "config"), "--add", key, value)
 			}
-			_, err := c.mountPlan(context.Background(), w, engine.image, true)
-			if err == nil || !strings.Contains(err.Error(), "does not support") {
-				t.Fatalf("layout rejection = %v", err)
+			sandboxTestGit(t, w.Root, "config", "--file", filepath.Join(w.CommonDir, "config"), "--add", key, value)
+			plan, err := c.mountPlan(t.Context(), w, engine.image, true)
+			invalid := strings.HasPrefix(layout, "glob") || strings.HasPrefix(layout, "missing") || strings.HasPrefix(layout, "symlink") || strings.HasPrefix(layout, "hardlink")
+			if (err != nil) != invalid {
+				t.Fatalf("include %s: %v", layout, err)
+			}
+			if invalid {
+				return
+			}
+			protected := false
+			for _, mount := range plan.Mounts {
+				if mount.Target == value && mount.ReadOnly {
+					protected = true
+				}
+				if mount.Snapshot && (bytes.Contains(mount.Content, []byte("[include")) || bytes.Contains(mount.Content, []byte("Included"))) {
+					t.Fatalf("snapshot retained include: %s", mount.Content)
+				}
+			}
+			if !protected {
+				t.Fatal("host include in writable worktree is unprotected")
 			}
 		})
 	}
@@ -360,7 +488,7 @@ func TestSandboxExecutablePolicyAndSymlinkAliases(t *testing.T) {
 	monitor := filepath.Join(w.Path, "monitor")
 	marker := filepath.Join(w.Path, "executed-on-host")
 	sandboxTestWrite(t, filepath.Join(hooks, "pre-commit"), "#!/bin/sh\nexit 0\n")
-	sandboxTestWrite(t, monitor, "#!/bin/sh\ntouch '"+marker+"'\n")
+	sandboxTestWrite(t, monitor, "#!/bin/bash\ntouch '"+marker+"'\n")
 	if err := os.Chmod(monitor, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -452,7 +580,7 @@ func TestSandboxMountPathInjection(t *testing.T) {
 	}
 }
 
-func TestSandboxRefusesHostSocket(t *testing.T) {
+func TestSandboxDoesNotScanWorktreeSockets(t *testing.T) {
 	c, w, engine := sandboxTestFixture(t)
 	listener, err := net.Listen("unix", filepath.Join(w.Path, "docker.sock"))
 	if err != nil {
@@ -463,8 +591,8 @@ func TestSandboxRefusesHostSocket(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	if _, err := c.mountPlan(context.Background(), w, engine.image, true); err == nil || !strings.Contains(err.Error(), "sockets") {
-		t.Fatalf("socket mount rejection = %v", err)
+	if _, err := c.mountPlan(context.Background(), w, engine.image, true); err != nil {
+		t.Fatalf("blanket socket scan differs from upstream: %v", err)
 	}
 }
 
@@ -519,7 +647,7 @@ func TestSandboxSnapshotCannotBeLinkedOrRewritten(t *testing.T) {
 	}
 }
 
-func TestSandboxRejectsPreexistingWorktreeHardlink(t *testing.T) {
+func TestSandboxDoesNotScanWorktreeHardlinks(t *testing.T) {
 	c, w, engine := sandboxTestFixture(t)
 	sentinel := filepath.Join(filepath.Dir(w.Root), "outside-sentinel")
 	sandboxTestWrite(t, sentinel, "must remain outside")
@@ -527,8 +655,8 @@ func TestSandboxRejectsPreexistingWorktreeHardlink(t *testing.T) {
 	if err := os.Link(sentinel, alias); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.mountPlan(context.Background(), w, engine.image, true); err == nil || !strings.Contains(err.Error(), "--no-hardlinks") {
-		t.Fatalf("preexisting hardlink to outside sentinel was accepted: %v", err)
+	if _, err := c.mountPlan(context.Background(), w, engine.image, true); err != nil {
+		t.Fatalf("non-policy hardlink rejected: %v", err)
 	}
 	first, err := os.Stat(sentinel)
 	if err != nil {
@@ -572,11 +700,8 @@ func TestSandboxLocalCloneObjectAliases(t *testing.T) {
 				t.Fatal("test clone did not establish the expected object inode relationship")
 			}
 			_, err = c.mountPlan(context.Background(), w, engine.image, true)
-			if noHardlinks && err != nil {
-				t.Fatalf("independent clone rejected: %v", err)
-			}
-			if !noHardlinks && (err == nil || !strings.Contains(err.Error(), "--no-hardlinks")) {
-				t.Fatalf("shared local clone object was accepted: %v", err)
+			if err != nil {
+				t.Fatalf("ordinary clone objects rejected: %v", err)
 			}
 		})
 	}
@@ -636,7 +761,7 @@ func TestSandboxDataLinks(t *testing.T) {
 				}
 			}
 			_, err := c.mountPlan(context.Background(), w, engine.image, true)
-			if kind == "internal" && err != nil || kind != "internal" && err == nil {
+			if err != nil {
 				t.Fatalf("data layout %s: %v", kind, err)
 			}
 		})
@@ -656,9 +781,6 @@ func TestSandboxWalkCancellation(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) || visits != 1 {
 		t.Fatalf("walk ignored cancellation: visits=%d error=%v", visits, err)
-	}
-	if err := sandboxWritableTree(ctx, root, nil); !errors.Is(err, context.Canceled) {
-		t.Fatalf("writable scan ignored cancellation: %v", err)
 	}
 	c, w, engine := sandboxTestFixture(t)
 	if _, err := c.mountPlan(ctx, w, engine.image, true); !errors.Is(err, context.Canceled) {
@@ -687,11 +809,333 @@ func TestSandboxConfiguredDelegateLimits(t *testing.T) {
 		}
 	}
 	sandboxTestGit(t, w.Root, "config", "filter.local.clean", "./missing-program --argument")
-	if _, err := c.mountPlan(context.Background(), w, engine.image, true); err == nil || !strings.Contains(err.Error(), "program must exist") {
-		t.Fatalf("explicit missing repository program was accepted: %v", err)
+	if _, err := c.mountPlan(context.Background(), w, engine.image, true); err != nil {
+		t.Fatalf("upstream skips nonexistent executable policy targets: %v", err)
 	}
 	sandboxTestGit(t, w.Root, "config", "filter.local.clean", "git-lfs clean -- %f")
 	if _, err := c.mountPlan(context.Background(), w, engine.image, true); err != nil {
 		t.Fatalf("ordinary PATH delegate was disabled: %v", err)
+	}
+}
+
+func TestSandboxOpenCodeConfigOverride(t *testing.T) {
+	for _, mode := range []string{"absolute", "tilde", "symlink", "default symlink", "missing", "overlap"} {
+		t.Run(mode, func(t *testing.T) {
+			c, w, _ := sandboxTestFixture(t)
+			real := filepath.Join(c.HomeDir, "dotfiles", ".opencode")
+			sandboxTestWrite(t, filepath.Join(real, "opencode.json"), "{}")
+			link := filepath.Join(c.HomeDir, ".config", "opencode")
+			if err := os.RemoveAll(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, link); err != nil {
+				t.Fatal(err)
+			}
+			w.Config.Sandbox.OpenCodeConfigDir = real
+			c.Getenv = func(key string) string {
+				if key == "XDG_CONFIG_HOME" && mode != "default symlink" {
+					return "relative-invalid-xdg"
+				}
+				return ""
+			}
+			switch mode {
+			case "tilde":
+				w.Config.Sandbox.OpenCodeConfigDir = "~/dotfiles/.opencode"
+			case "symlink":
+				w.Config.Sandbox.OpenCodeConfigDir = link
+			case "default symlink":
+				w.Config.Sandbox.OpenCodeConfigDir = ""
+			case "missing":
+				w.Config.Sandbox.OpenCodeConfigDir = real + "-missing"
+			case "overlap":
+				w.Config.Sandbox.OpenCodeConfigDir = w.Path
+			}
+			var plan sandboxMountPlan
+			err := c.credentialMounts(t.Context(), w, &plan, true)
+			wantErr := mode == "symlink" || mode == "default symlink" || mode == "overlap"
+			if (err != nil) != wantErr {
+				t.Fatalf("credential mounts error = %v", err)
+			}
+			if wantErr {
+				return
+			}
+			mounted := false
+			for _, mount := range plan.Mounts {
+				if mount.Target == "/tmp/.config/opencode" {
+					mounted = true
+					if mount.Source != real || !mount.ReadOnly {
+						t.Fatalf("config mount = %+v", mount)
+					}
+				}
+			}
+			if mounted != (mode != "missing") {
+				t.Fatalf("config mounted = %v", mounted)
+			}
+			if mode == "missing" {
+				if _, err := os.Lstat(w.Config.Sandbox.OpenCodeConfigDir); !os.IsNotExist(err) {
+					t.Fatalf("missing directory created: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestSandboxOpenCodeConfigInvalidPath(t *testing.T) {
+	c := Containers{HomeDir: t.TempDir()}
+	for _, path := range []string{"relative", "~other/config", "~", "/", "/tmp/../config", "~/../config", "~/config/", "/tmp/config,other", "/tmp/config\n"} {
+		if _, err := c.openCodeConfigDir(SandboxConfig{OpenCodeConfigDir: path}); err == nil {
+			t.Errorf("accepted invalid path %q", path)
+		}
+	}
+}
+
+func TestSandboxOptionalOpenCodeConfig(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing", true: "empty existing"}[existing], func(t *testing.T) {
+			c, w, engine := sandboxTestFixture(t)
+			config := filepath.Join(c.HomeDir, ".config", "opencode")
+			if err := os.RemoveAll(config); err != nil {
+				t.Fatal(err)
+			}
+			if existing {
+				if err := os.Mkdir(config, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := c.Check(t.Context(), w.Config.Sandbox); err != nil {
+				t.Fatal(err)
+			}
+			plan := sandboxTestPlan(t, c, w, engine.image)
+			mounted := false
+			for _, mount := range plan.Mounts {
+				if mount.Target == "/tmp/.config/opencode" {
+					mounted = true
+					if mount.Source != config || !mount.ReadOnly {
+						t.Fatalf("config mount = %+v", mount)
+					}
+				}
+			}
+			if mounted != existing {
+				t.Fatalf("config mount present = %v", mounted)
+			}
+			if _, err := os.Stat(filepath.Join(config, ".gitignore")); !os.IsNotExist(err) {
+				t.Fatalf("created user metadata: %v", err)
+			}
+			if !existing {
+				if _, err := os.Stat(config); !os.IsNotExist(err) {
+					t.Fatalf("created missing host config: %v", err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(c.HomeDir, ".local", "share", "opencode")); err != nil {
+				t.Fatalf("missing shared data: %v", err)
+			}
+		})
+	}
+}
+
+func sandboxTestSubmodule(t *testing.T, w Workspace) (string, string) {
+	t.Helper()
+	source := filepath.Join(filepath.Dir(w.Root), "module-source")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sandboxTestGit(t, source, "init", "-q", "--template=", "--initial-branch=main")
+	sandboxTestGit(t, source, "config", "user.name", "Module Test")
+	sandboxTestGit(t, source, "config", "user.email", "module@example.invalid")
+	sandboxTestWrite(t, filepath.Join(source, "module-file"), "module\n")
+	sandboxTestGit(t, source, "add", "module-file")
+	sandboxTestGit(t, source, "-c", "commit.gpgsign=false", "commit", "-qm", "module")
+	sandboxTestGit(t, w.Path, "-c", "protocol.file.allow=always", "submodule", "add", "--name", "config", source, "vendor/module")
+	worktree := filepath.Join(w.Path, "vendor", "module")
+	admin := strings.TrimSpace(string(sandboxTestGit(t, worktree, "rev-parse", "--absolute-git-dir")))
+	return worktree, admin
+}
+
+func TestSandboxSubmoduleMetadata(t *testing.T) {
+	c, w, engine := sandboxTestFixture(t)
+	worktree, admin := sandboxTestSubmodule(t, w)
+	plan := sandboxTestPlan(t, c, w, engine.image)
+	want := map[string]bool{filepath.Join(worktree, ".git"): true, admin: false}
+	for _, name := range []string{"config", "config.worktree", "hooks", "info", "objects/info", "modules", "worktrees"} {
+		want[filepath.Join(admin, name)] = true
+	}
+	for _, mount := range plan.Mounts {
+		if ro, ok := want[mount.Target]; ok {
+			if mount.ReadOnly != ro {
+				t.Fatalf("submodule mount = %+v", mount)
+			}
+			delete(want, mount.Target)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing submodule protection: %v", want)
+	}
+}
+
+func TestSandboxSubmoduleConfigNamespaces(t *testing.T) {
+	for _, location := range []string{"common", "current admin"} {
+		t.Run(location, func(t *testing.T) {
+			c, w, engine := sandboxTestFixture(t)
+			identity, err := discoverSandboxGit(w.Path, w.CommonDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent := identity.Common
+			if location == "current admin" {
+				parent = identity.Admin
+			}
+			namespace := filepath.Join(parent, "modules")
+			roots := []string{
+				filepath.Join(namespace, "config"),
+				filepath.Join(namespace, "vendor", "config"),
+				filepath.Join(namespace, "config", "modules", "config"),
+				filepath.Join(namespace, "config", "modules", "config", "modules", "config"),
+			}
+			for i, root := range roots {
+				sandboxTestWrite(t, filepath.Join(root, "config"), "[core]\n\tbare = false\n")
+				sandboxTestWrite(t, filepath.Join(root, "HEAD"), "ref: refs/heads/main\n")
+				for _, name := range []string{"objects", "refs"} {
+					if err := os.MkdirAll(filepath.Join(root, name), 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				sandboxTestWrite(t, filepath.Join(w.Path, fmt.Sprintf("module-%d", i), ".git"), "gitdir: "+root+"\n")
+			}
+			plan := sandboxTestPlan(t, c, w, engine.image)
+			for _, root := range roots {
+				for _, target := range []string{root, filepath.Join(root, "config"), filepath.Join(root, "objects"), filepath.Join(root, "refs"), filepath.Join(root, "hooks"), filepath.Join(root, "objects", "info")} {
+					var effective *sandboxMount
+					for i := range plan.Mounts {
+						mount := &plan.Mounts[i]
+						if sandboxWithin(mount.Target, target) && (effective == nil || len(mount.Target) > len(effective.Target)) {
+							effective = mount
+						}
+					}
+					ro := target == filepath.Join(root, "config") || target == filepath.Join(root, "hooks") || target == filepath.Join(root, "objects", "info")
+					if effective == nil || effective.ReadOnly != ro {
+						t.Fatalf("wrong effective mount at %s: %+v", target, effective)
+					}
+					if target == filepath.Join(root, "config") && (!effective.Snapshot || effective.Source == target) {
+						t.Fatalf("module config not snapshotted: %+v", effective)
+					}
+				}
+			}
+			for _, mount := range plan.Mounts {
+				if (mount.Target == namespace || mount.Target == filepath.Join(namespace, "vendor") || strings.HasSuffix(mount.Target, "/modules")) && !mount.ReadOnly {
+					t.Fatalf("module namespace mistaken for Git root: %+v", mount)
+				}
+			}
+		})
+	}
+}
+
+func TestSandboxSubmoduleRootTypes(t *testing.T) {
+	for _, layout := range []string{"HEAD directory", "objects file", "HEAD and objects", "config symlink", "HEAD symlink", "objects symlink", "namespace symlink"} {
+		t.Run(layout, func(t *testing.T) {
+			c, w, engine := sandboxTestFixture(t)
+			root := filepath.Join(w.CommonDir, "modules", "candidate")
+			if err := os.MkdirAll(root, 0700); err != nil {
+				t.Fatal(err)
+			}
+			sandboxTestWrite(t, filepath.Join(root, "HEAD"), "ref: refs/heads/main\n")
+			if err := os.Mkdir(filepath.Join(root, "objects"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			switch layout {
+			case "HEAD directory":
+				if err := os.Remove(filepath.Join(root, "HEAD")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(filepath.Join(root, "HEAD"), 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "objects file":
+				if err := os.Remove(filepath.Join(root, "objects")); err != nil {
+					t.Fatal(err)
+				}
+				sandboxTestWrite(t, filepath.Join(root, "objects"), "not a directory")
+			case "config symlink", "HEAD symlink", "objects symlink", "namespace symlink":
+				name := strings.TrimSuffix(layout, " symlink")
+				path := filepath.Join(root, name)
+				if name == "namespace" {
+					path = root
+				}
+				target := filepath.Join(filepath.Dir(w.Root), "outside-metadata")
+				if name == "config" {
+					sandboxTestWrite(t, target, "[core]\nbare = false\n")
+				} else if err := os.Rename(path, target); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			plan, err := c.mountPlan(t.Context(), w, engine.image, true)
+			if strings.HasSuffix(layout, "symlink") {
+				if err == nil {
+					t.Fatal("unsafe metadata symlink accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			mounted := slices.ContainsFunc(plan.Mounts, func(m sandboxMount) bool { return m.Target == root && !m.ReadOnly })
+			if mounted != (layout == "HEAD and objects") {
+				t.Fatalf("type-based Git root detection = %v", mounted)
+			}
+			if !mounted {
+				if _, err := os.Stat(filepath.Join(root, "config")); !os.IsNotExist(err) {
+					t.Fatalf("namespace mutated as a Git root: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestSandboxIncludedExecutablePolicy(t *testing.T) {
+	c, w, engine := sandboxTestFixture(t)
+	include := filepath.Join(w.Path, "included-policy")
+	program := filepath.Join(w.Path, "host-monitor")
+	sandboxTestWrite(t, program, "#!/bin/sh\nexit 0\n")
+	sandboxTestWrite(t, include, "[core]\nfsmonitor = "+program+"\n")
+	sandboxTestGit(t, w.Root, "config", "include.path", include)
+	plan := sandboxTestPlan(t, c, w, engine.image)
+	for _, path := range []string{include, program} {
+		if !slices.ContainsFunc(plan.Mounts, func(m sandboxMount) bool { return m.Target == path && m.ReadOnly }) {
+			t.Fatalf("included policy is writable: %s", path)
+		}
+	}
+	if err := os.Link(program, filepath.Join(w.Path, "monitor-alias")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.mountPlan(t.Context(), w, engine.image, true); err == nil {
+		t.Fatal("included executable hardlink bypass accepted")
+	}
+}
+
+func TestSandboxPolicyPathsResolveBeforeCleaning(t *testing.T) {
+	for _, kind := range []string{"include", "monitor"} {
+		t.Run(kind, func(t *testing.T) {
+			c, w, engine := sandboxTestFixture(t)
+			outside := filepath.Join(filepath.Dir(w.Root), "outside-policy")
+			if err := os.MkdirAll(filepath.Join(outside, "child"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			sandboxTestWrite(t, filepath.Join(outside, "policy"), "[user]\nname = Actual\n")
+			sandboxTestWrite(t, filepath.Join(w.Path, "policy"), "[user]\nname = Decoy\n")
+			link := filepath.Join(w.Path, "redirect")
+			if err := os.Symlink(filepath.Join(outside, "child"), link); err != nil {
+				t.Fatal(err)
+			}
+			key := "include.path"
+			if kind == "monitor" {
+				key = "core.fsmonitor"
+			}
+			sandboxTestGit(t, w.Root, "config", key, link+"/../policy")
+			if _, err := c.mountPlan(t.Context(), w, engine.image, true); err == nil {
+				t.Fatal("lexical cleaning protected a different policy than Git reads")
+			}
+		})
 	}
 }

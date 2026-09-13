@@ -1,5 +1,5 @@
-# Installed externally as config.yaml. Omitted keys inherit, null is rejected.
-# Use panes: [] for one shell, and [] to disable hooks or file lists.
+# Installed externally as config.yaml. Omitted and null optional values inherit.
+# Use panes: [] for no additional setup, and [] to disable hooks or file lists.
 panes:
   - command: editor
     focus: true

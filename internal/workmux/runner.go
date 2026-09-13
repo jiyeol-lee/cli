@@ -3,6 +3,7 @@ package workmux
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +20,7 @@ type Process struct {
 	Env          []string
 	CleanGitEnv  bool
 	ProcessGroup bool
+	Foreground   bool
 	Stdin        io.Reader
 	Stdout       io.Writer
 	Stderr       io.Writer
@@ -30,9 +32,20 @@ type Runner interface {
 
 type ExecRunner struct{}
 
+var ErrInterrupt = fmt.Errorf("interrupted: %w", context.Canceled)
+var ErrTerminate = fmt.Errorf("terminated: %w", context.Canceled)
+
 func (ExecRunner) Run(ctx context.Context, p Process) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, p.Name, p.Args...)
 	cmd.WaitDelay = time.Second
+	if p.Foreground {
+		cmd.Cancel = func() error {
+			if errors.Is(context.Cause(ctx), ErrInterrupt) {
+				return cmd.Process.Signal(os.Interrupt)
+			}
+			return cmd.Process.Signal(syscall.SIGTERM)
+		}
+	}
 	group := p.ProcessGroup
 	if stdin, ok := p.Stdin.(*os.File); ok {
 		info, err := stdin.Stat()
@@ -75,7 +88,7 @@ func (ExecRunner) Run(ctx context.Context, p Process) ([]byte, error) {
 	}
 	err := cmd.Run()
 	if ctx.Err() != nil {
-		return stdout.Bytes(), ctx.Err()
+		return stdout.Bytes(), context.Cause(ctx)
 	}
 	if err != nil {
 		message := strings.TrimSpace(stderr.String())
