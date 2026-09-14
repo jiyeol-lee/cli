@@ -61,7 +61,7 @@ func (c AIClient) Generate(ctx context.Context, prompt string, out io.Writer) er
 	if err != nil {
 		return fmt.Errorf("AI request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		message, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("AI request returned %s: %s", resp.Status, strings.TrimSpace(string(message)))
@@ -153,8 +153,8 @@ func parseSSE(r io.Reader, out io.Writer) (bool, error) {
 			}
 			continue
 		}
-		if strings.HasPrefix(line, "data:") {
-			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		if value, ok := strings.CutPrefix(line, "data:"); ok {
+			data = append(data, strings.TrimSpace(value))
 		}
 	}
 	if err := scanner.Err(); err != nil {
