@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"path"
@@ -21,7 +22,7 @@ type migration struct {
 }
 
 // Migrate applies an application's embedded SQL migrations in version order.
-func Migrate(ctx context.Context, db *sql.DB, app string, migrationFS fs.FS, dir string) error {
+func Migrate(ctx context.Context, db *sql.DB, app string, migrationFS fs.FS, dir string) (migrationErr error) {
 	if strings.TrimSpace(app) == "" {
 		return fmt.Errorf("migration app cannot be empty")
 	}
@@ -34,11 +35,16 @@ func Migrate(ctx context.Context, db *sql.DB, app string, migrationFS fs.FS, dir
 	if err != nil {
 		return fmt.Errorf("get migration connection for %s: %w", app, err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			migrationErr = errors.Join(migrationErr, fmt.Errorf("close migration connection for %s: %w", app, err))
+		}
+	}()
 	if _, err := conn.ExecContext(ctx, beginImmediateSQL); err != nil {
 		return fmt.Errorf("begin migrations for %s: %w", app, err)
 	}
-	defer conn.ExecContext(context.Background(), rollbackSQL)
+	// Best-effort cleanup on failure; after COMMIT there is nothing to roll back.
+	defer func() { _, _ = conn.ExecContext(context.Background(), rollbackSQL) }()
 
 	if _, err := conn.ExecContext(ctx, createMigrationLedgerSQL); err != nil {
 		return fmt.Errorf("create migration ledger: %w", err)
@@ -112,7 +118,7 @@ func appliedMigrations(ctx context.Context, conn *sql.Conn, app string) ([]migra
 	if err != nil {
 		return nil, fmt.Errorf("read applied migrations for %s: %w", app, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var applied []migration
 	for rows.Next() {

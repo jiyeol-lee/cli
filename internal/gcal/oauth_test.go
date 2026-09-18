@@ -27,7 +27,9 @@ func TestOAuthAuthorizeServesCallbackBeforeOpeningURL(t *testing.T) {
 			t.Errorf("code = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"access_token":"access-token","refresh_token":"refresh-token","token_type":"Bearer"}`)
+		if _, err := fmt.Fprint(w, `{"access_token":"access-token","refresh_token":"refresh-token","token_type":"Bearer"}`); err != nil {
+			t.Error(err)
+		}
 	}))
 	defer tokenServer.Close()
 
@@ -56,7 +58,11 @@ func TestOAuthAuthorizeServesCallbackBeforeOpeningURL(t *testing.T) {
 				openerErr = err
 				return err
 			}
-			defer response.Body.Close()
+			defer func() {
+				if err := response.Body.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
 			_, _ = io.Copy(io.Discard, response.Body)
 			if response.StatusCode != http.StatusOK {
 				openerErr = fmt.Errorf("callback status = %d", response.StatusCode)
@@ -82,7 +88,9 @@ func TestOAuthAuthorizeServesCallbackBeforeOpeningURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OAuth callback listener was not released: %v", err)
 	}
-	listener.Close()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestAuthorizationURLRequestsRefreshTokenAndConsentWithPKCE(t *testing.T) {
@@ -114,6 +122,59 @@ func TestAuthorizationURLRequestsRefreshTokenAndConsentWithPKCE(t *testing.T) {
 		if got := query.Get(key); got != wantValue {
 			t.Errorf("%s = %q, want %q", key, got, wantValue)
 		}
+	}
+}
+
+func TestOAuthAuthorizeReturnsOutputErrorAndReleasesListener(t *testing.T) {
+	reader, writer := io.Pipe()
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := writer.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	openerCalled := false
+	oauth := OAuth{
+		Stdout: writer,
+		OpenURL: func(string) error {
+			openerCalled = true
+			return nil
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	config := &oauth2.Config{Endpoint: oauth2.Endpoint{AuthURL: "https://accounts.example.test/authorize"}}
+	token, err := oauth.authorize(ctx, config)
+	if !errors.Is(err, io.ErrClosedPipe) || token != nil || openerCalled {
+		t.Fatalf("token = %v, error = %v, opener called = %v; want output failure before opening browser", token, err, openerCalled)
+	}
+	listener, err := net.Listen("tcp", oauthCallbackAddress)
+	if err != nil {
+		t.Fatalf("OAuth callback listener was not released after output failure: %v", err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type disconnectedCallbackWriter struct{ *httptest.ResponseRecorder }
+
+func (disconnectedCallbackWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestOAuthCallbackKeepsCodeWhenBrowserDisconnects(t *testing.T) {
+	results := make(chan callbackResult, 1)
+	handler := oauthCallbackHandler("expected-state", results)
+	writer := disconnectedCallbackWriter{httptest.NewRecorder()}
+	handler.ServeHTTP(writer, httptest.NewRequest(http.MethodGet, "/callback?state=expected-state&code=valid", nil))
+	select {
+	case result := <-results:
+		if result.code != "valid" || result.err != nil {
+			t.Fatalf("result = %#v", result)
+		}
+	default:
+		t.Fatal("browser disconnect discarded the authorization code")
 	}
 }
 

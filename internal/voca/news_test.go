@@ -55,7 +55,11 @@ func TestAPHTTPClientUsesHTTP1(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer resp.Body.Close()
+			t.Cleanup(func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Error(err)
+				}
+			})
 			if resp.Proto != tc.want || resp.Header.Get("Request-Protocol") != tc.want {
 				t.Fatalf("response protocol = %s, request protocol = %s, want %s", resp.Proto, resp.Header.Get("Request-Protocol"), tc.want)
 			}
@@ -107,7 +111,11 @@ func TestParseHeadlinesPreservesAPHierarchyAndDocumentOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	doc, err := html.Parse(file)
 	if err != nil {
 		t.Fatal(err)
@@ -281,12 +289,78 @@ func TestSelectArticle(t *testing.T) {
 	}
 }
 
+type newsWriterFunc func([]byte) (int, error)
+
+func (write newsWriterFunc) Write(p []byte) (int, error) { return write(p) }
+
+func TestRenderHeadlineTableReturnsWriteErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		articles []ArticleLink
+	}{
+		{name: "flush"},
+		{name: "main title", articles: []ArticleLink{{Title: "Main headline\n\n"}}},
+		{name: "related title", articles: []ArticleLink{{Title: "Main headline", Related: []ArticleLink{{Title: "Related headline\n\n"}}}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			writes := 0
+			output := newsWriterFunc(func(p []byte) (int, error) {
+				writes++
+				if writes == 1 {
+					return 0, io.ErrClosedPipe
+				}
+				return len(p), nil
+			})
+			if err := renderHeadlineTable(output, tt.articles); !errors.Is(err, io.ErrClosedPipe) {
+				t.Fatalf("error = %v, want first write error", err)
+			}
+			if writes != 1 {
+				t.Fatalf("writes = %d, want no writes after failure", writes)
+			}
+		})
+	}
+}
+
+func TestNewsReturnsStderrErrors(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if _, err := io.WriteString(w, `<div class="TwoColumnContainer7030-container"><bsp-custom-headline><a href="/article/example">Example headline for testing</a></bsp-custom-headline></div>`); err != nil {
+			t.Error(err)
+		}
+	}))
+	t.Cleanup(server.Close)
+	news := News{Scraper: APScraper{HTTP: server.Client(), BaseURL: server.URL}}
+	for _, tt := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "selection", input: "invalid\nq\n", want: "invalid article index"},
+		{name: "fetch", input: "1\nq\n", want: "AP News returned 503"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stderr := newsWriterFunc(func([]byte) (int, error) { return 0, io.ErrClosedPipe })
+			err := news.Run(context.Background(), strings.NewReader(tt.input), io.Discard, stderr)
+			if !errors.Is(err, io.ErrClosedPipe) || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want write error and %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseArticle(t *testing.T) {
 	file, err := os.Open("testdata/ap_article.html")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	doc, err := html.Parse(file)
 	if err != nil {
 		t.Fatal(err)

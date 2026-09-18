@@ -15,7 +15,11 @@ func testRepository(t *testing.T) *Repository {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	if err := Migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
