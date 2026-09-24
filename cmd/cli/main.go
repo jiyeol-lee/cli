@@ -2,34 +2,89 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/jiyeol-lee/cli/internal/database"
 	"github.com/jiyeol-lee/cli/internal/gcal"
 	"github.com/jiyeol-lee/cli/internal/memory"
 	"github.com/jiyeol-lee/cli/internal/voca"
+	"github.com/jiyeol-lee/cli/internal/workmux"
 	"github.com/jiyeol-lee/cli/internal/xdg"
 	"google.golang.org/api/calendar/v3"
 	"google.golang.org/api/option"
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := commandSignalContext()
 	defer stop()
-	if err := run(ctx, os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "cli:", err)
-		os.Exit(1)
+	err := run(ctx, os.Args[1:])
+	if ctx.Err() != nil && !errors.Is(err, context.Cause(ctx)) {
+		err = errors.Join(err, context.Cause(ctx))
 	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cli:", err)
+		os.Exit(commandExitCode(os.Args[1:], err))
+	}
+}
+
+func commandSignalContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case received := <-signals:
+			if received == syscall.SIGTERM {
+				cancel(workmux.ErrTerminate)
+			} else {
+				cancel(workmux.ErrInterrupt)
+			}
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() { signal.Stop(signals); cancel(context.Canceled) }
+}
+
+func commandExitCode(args []string, err error) int {
+	if len(args) >= 3 && args[0] == "workmux" && args[1] == "sandbox" && (args[2] == "shell" || args[2] == "run") {
+		if errors.Is(err, workmux.ErrTerminate) {
+			return 143
+		}
+		if errors.Is(err, workmux.ErrInterrupt) {
+			return 130
+		}
+		if exit, ok := errors.AsType[*exec.ExitError](err); ok {
+			if exit.ExitCode() > 0 {
+				return exit.ExitCode()
+			}
+			if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				return 128 + int(status.Signal())
+			}
+		}
+		if errors.Is(err, context.Canceled) {
+			return 130
+		}
+	}
+	return 1
 }
 
 func run(ctx context.Context, args []string) error {
 	return runWithDependencies(ctx, args, dependencies{
-		newCalendar:       newGoogleCalendar,
+		newCalendar: newGoogleCalendar,
+		newWorkmux: func() (workmux.App, error) {
+			return newWorkmuxApp(os.Stdin, os.Stdout, os.Stderr)
+		},
+		newCleanup: func(paths workmux.CleanupPaths) workmux.App {
+			return workmuxApp(paths, nil, io.Discard, io.Discard)
+		},
 		directoryResolver: memory.Resolver{Runner: memory.GitWorktreeRunner{}},
 		stdout:            os.Stdout,
 	})
@@ -37,13 +92,15 @@ func run(ctx context.Context, args []string) error {
 
 type dependencies struct {
 	newCalendar       func(context.Context, xdg.Dirs) (gcal.Calendar, error)
+	newWorkmux        func() (workmux.App, error)
+	newCleanup        func(workmux.CleanupPaths) workmux.App
 	directoryResolver memory.DirectoryResolver
 	stdout            io.Writer
 }
 
-func runWithDependencies(ctx context.Context, args []string, deps dependencies) error {
+func runWithDependencies(ctx context.Context, args []string, deps dependencies) (runErr error) {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: cli <voca|gcal|memory> ...")
+		return fmt.Errorf("usage: cli <voca|gcal|memory|workmux> <command> [arguments]")
 	}
 	var calendarCommand gcal.Command
 	var memoryCommand memory.Command
@@ -75,6 +132,33 @@ func runWithDependencies(ctx context.Context, args []string, deps dependencies) 
 		if command.Kind == memory.CommandDirectory {
 			return (memory.App{Resolver: deps.directoryResolver, Stdout: deps.stdout}).Run(ctx, command)
 		}
+	case "workmux":
+		if len(args) > 1 && args[1] == "_cleanup" {
+			command, err := workmux.ParseCleanupCommand(args[1:])
+			if err != nil {
+				return err
+			}
+			if deps.newCleanup == nil {
+				return fmt.Errorf("workmux cleanup dependencies are not configured")
+			}
+			return workmux.RunCleanupProcess(ctx, command, deps.newCleanup)
+		}
+		command, err := workmux.ParseCommand(args[1:])
+		if err != nil {
+			return err
+		}
+		if command.Help {
+			_, err := io.WriteString(deps.stdout, workmux.Usage)
+			return err
+		}
+		if deps.newWorkmux == nil {
+			return fmt.Errorf("workmux dependencies are not configured")
+		}
+		app, err := deps.newWorkmux()
+		if err != nil {
+			return err
+		}
+		return app.Run(ctx, command)
 	default:
 		return fmt.Errorf("unknown app %q", args[0])
 	}
@@ -88,7 +172,11 @@ func runWithDependencies(ctx context.Context, args []string, deps dependencies) 
 		if err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() {
+			if err := db.Close(); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("close database: %w", err))
+			}
+		}()
 		if err := voca.Migrate(ctx, db); err != nil {
 			return err
 		}
@@ -111,7 +199,11 @@ func runWithDependencies(ctx context.Context, args []string, deps dependencies) 
 		if err != nil {
 			return err
 		}
-		defer db.Close()
+		defer func() {
+			if err := db.Close(); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("close database: %w", err))
+			}
+		}()
 		if err := memory.Migrate(ctx, db); err != nil {
 			return err
 		}
@@ -136,4 +228,38 @@ func newGoogleCalendar(ctx context.Context, dirs xdg.Dirs) (gcal.Calendar, error
 		return gcal.Calendar{}, fmt.Errorf("create Google Calendar client: %w", err)
 	}
 	return gcal.Calendar{Source: gcal.GoogleSource{Service: service}, CalendarID: os.Getenv("GCAL_CALENDAR_ID")}, nil
+}
+
+func newWorkmuxApp(stdin io.Reader, stdout, stderr io.Writer) (workmux.App, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return workmux.App{}, fmt.Errorf("resolve workmux home: %w", err)
+	}
+	if !filepath.IsAbs(home) {
+		return workmux.App{}, fmt.Errorf("workmux home directory must be absolute")
+	}
+	stateHome := os.Getenv("XDG_STATE_HOME")
+	if stateHome == "" {
+		stateHome = filepath.Join(home, ".local", "state")
+	}
+	if !filepath.IsAbs(stateHome) {
+		return workmux.App{}, fmt.Errorf("XDG_STATE_HOME must be absolute")
+	}
+	stateDir := filepath.Join(stateHome, "cli", "workmux")
+	return workmuxApp(workmux.CleanupPaths{HomeDir: home, StateDir: stateDir, ConfigDir: filepath.Join(home, ".config", "cli", "workmux")}, stdin, stdout, stderr), nil
+}
+
+func workmuxApp(paths workmux.CleanupPaths, stdin io.Reader, stdout, stderr io.Writer) workmux.App {
+	runner := workmux.ExecRunner{}
+	return workmux.App{
+		Runner:  runner,
+		Mux:     workmux.Tmux{Runner: runner},
+		Spawner: workmux.ExecCleanupSpawner{},
+		Sandbox: &workmux.Containers{
+			Runner: runner, HomeDir: paths.HomeDir, StateDir: paths.StateDir,
+		},
+		Stdin: stdin, Stdout: stdout, Stderr: stderr,
+		HomeDir: paths.HomeDir, StateDir: paths.StateDir,
+		ConfigDir: paths.ConfigDir,
+	}
 }

@@ -51,7 +51,7 @@ func (r *Repository) Read(ctx context.Context, scope Scope, projectDirectory str
 	if err != nil {
 		return nil, fmt.Errorf("read memories: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []Entry
 	for rows.Next() {
