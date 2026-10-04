@@ -88,7 +88,8 @@ func (o OAuth) authorize(ctx context.Context, config *oauth2.Config) (*oauth2.To
 	if err != nil {
 		return nil, fmt.Errorf("start OAuth callback on %s: %w", oauthCallbackAddress, err)
 	}
-	defer listener.Close()
+	// Shutdown also closes the listener once the callback server has started.
+	defer func() { _ = listener.Close() }()
 	state, err := randomState()
 	if err != nil {
 		return nil, err
@@ -100,12 +101,14 @@ func (o OAuth) authorize(ctx context.Context, config *oauth2.Config) (*oauth2.To
 	mux.Handle(oauthCallbackPath, oauthCallbackHandler(state, resultCh))
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(listener) }()
 	out := o.Stdout
 	if out == nil {
 		out = io.Discard
 	}
-	fmt.Fprintf(out, "Open this URL to authorize Google Calendar:\n%s\n", authURL)
+	if _, err := fmt.Fprintf(out, "Open this URL to authorize Google Calendar:\n%s\n", authURL); err != nil {
+		return nil, fmt.Errorf("write Google authorization URL: %w", err)
+	}
+	go func() { serveErr <- server.Serve(listener) }()
 	opener := o.OpenURL
 	if opener == nil {
 		opener = openBrowser
@@ -120,7 +123,7 @@ func (o OAuth) authorize(ctx context.Context, config *oauth2.Config) (*oauth2.To
 	case <-ctx.Done():
 		result.err = ctx.Err()
 	case <-time.After(timeout):
-		result.err = fmt.Errorf("Google OAuth callback timed out")
+		result.err = fmt.Errorf("timed out waiting for Google OAuth callback")
 	case result = <-resultCh:
 	case err := <-serveErr:
 		result.err = fmt.Errorf("OAuth callback server: %w", err)
@@ -160,7 +163,7 @@ func oauthCallbackHandler(state string, resultCh chan<- callbackResult) http.Han
 		if message := r.URL.Query().Get("error"); message != "" {
 			http.Error(w, message, http.StatusBadRequest)
 			select {
-			case resultCh <- callbackResult{err: fmt.Errorf("Google OAuth: %s", message)}:
+			case resultCh <- callbackResult{err: fmt.Errorf("authorize Google OAuth: %s", message)}:
 			default:
 			}
 			return
@@ -170,7 +173,8 @@ func oauthCallbackHandler(state string, resultCh chan<- callbackResult) http.Han
 			http.Error(w, "authorization code missing", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprintln(w, "Authorization complete. You can close this window.")
+		// A disconnected browser does not invalidate the authorization code.
+		_, _ = fmt.Fprintln(w, "Authorization complete. You can close this window.")
 		select {
 		case resultCh <- callbackResult{code: code}:
 		default:
@@ -208,7 +212,7 @@ func loadToken(path string) (*oauth2.Token, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	var token oauth2.Token
 	if err := json.NewDecoder(file).Decode(&token); err != nil {
 		return nil, err
@@ -225,13 +229,14 @@ func saveToken(path string, token *oauth2.Token) error {
 		return err
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	// Remove a failed write's temporary file; Rename removes it on success.
+	defer func() { _ = os.Remove(tmpPath) }()
 	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := json.NewEncoder(tmp).Encode(token); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {

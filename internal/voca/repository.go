@@ -60,7 +60,7 @@ func (r *Repository) List(ctx context.Context) ([]Word, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var words []Word
 	for rows.Next() {
 		var w Word
@@ -89,7 +89,7 @@ func (r *Repository) Random(ctx context.Context, limit int) ([]Word, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var words []Word
 	for rows.Next() {
 		var w Word
@@ -115,7 +115,8 @@ func (r *Repository) Increment(ctx context.Context, ids []int64) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	// Rollback is best-effort on failure and a no-op after Commit.
+	defer func() { _ = tx.Rollback() }()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, id := range ids {
 		if _, err := tx.ExecContext(ctx, incrementSQL, now, id); err != nil {
