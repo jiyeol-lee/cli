@@ -53,7 +53,11 @@ func openMigrationTestHandles(t *testing.T, path string) [2]*sql.DB {
 			t.Fatal(err)
 		}
 		dbs[i] = db
-		t.Cleanup(func() { db.Close() })
+		t.Cleanup(func() {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		})
 	}
 	return dbs
 }
@@ -112,7 +116,11 @@ func migrationTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	return db
 }
 
@@ -133,7 +141,11 @@ func TestMigrateFreshAndRepeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	t.Cleanup(func() {
+		if err := rows.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	wantNames := []string{"0001_create_table.sql", "0002_add_value.sql"}
 	for version, wantName := range wantNames {
 		if !rows.Next() {
@@ -150,6 +162,9 @@ func TestMigrateFreshAndRepeat(t *testing.T) {
 	}
 	if rows.Next() {
 		t.Fatal("repeat migration added a ledger row")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
 

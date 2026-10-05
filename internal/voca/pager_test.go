@@ -73,7 +73,7 @@ func installPagerCommands(t *testing.T, awk, less string) {
 		t.Helper()
 		content := body
 		if body != "" {
-			content = "#!/bin/sh\n" + body + "\n"
+			content = "#!/bin/bash\n" + body + "\n"
 		}
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0700); err != nil {
 			t.Fatal(err)

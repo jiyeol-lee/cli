@@ -13,7 +13,11 @@ func TestOpenPermanentPragmas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	var foreignKeys int
 	if err := db.QueryRowContext(context.Background(), "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
 		t.Fatal(err)
@@ -62,11 +66,11 @@ func TestOpenPermanentEncodesFileURIPath(t *testing.T) {
 				t.Fatal(err)
 			}
 			if _, err := db.Exec("CREATE TABLE entries (value TEXT NOT NULL)"); err != nil {
-				db.Close()
+				_ = db.Close()
 				t.Fatal(err)
 			}
 			if _, err := db.Exec("INSERT INTO entries (value) VALUES ('saved')"); err != nil {
-				db.Close()
+				_ = db.Close()
 				t.Fatal(err)
 			}
 			if err := db.Close(); err != nil {
@@ -80,7 +84,11 @@ func TestOpenPermanentEncodesFileURIPath(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			t.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					t.Error(err)
+				}
+			})
 			var value string
 			if err := db.QueryRow("SELECT value FROM entries").Scan(&value); err != nil {
 				t.Fatal(err)

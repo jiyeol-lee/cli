@@ -1,6 +1,6 @@
 # cli
 
-`cli` is one personal command-line program for vocabulary practice, AP News reading, a read-only view of today's Google Calendar, and scoped conversation memories.
+`cli` is one personal command-line program for vocabulary practice, AP News reading, a read-only view of today's Google Calendar, scoped conversation memories, and Git worktrees in tmux.
 
 ## Install
 
@@ -34,6 +34,8 @@ cli memory directory
 cli memory read [--scope all|project|global]
 cli memory write <memory words...> --category preference|convention|note --scope project|global
 cli memory archive <positive-id> --scope project|global
+
+cli workmux --help
 ```
 
 Calendar commands emit JSON arrays by default. Empty JSON output is `[]`. `--text` prints one event per line as `Summary (08:30 - 09:00)` for timed events and only the summary for all-day events. Text output always ends with a newline, and an empty result is `N/A`. `--join separator` replaces the newline between text events with the given separator and requires `--text`. The separator may be empty.
@@ -44,13 +46,15 @@ Memory commands store preferences, conventions, and notes at project or global s
 
 ## Data locations
 
-Permanent data lives in `$XDG_DATA_HOME/cli`. `$XDG_DATA_HOME` must be an absolute path. Vocabulary and memory data share the SQLite database at `cli.sqlite3`. The Google token has a fixed location:
+Vocabulary, memory, and calendar data live in `$XDG_DATA_HOME/cli`. These apps require an absolute `$XDG_DATA_HOME`. Vocabulary and memory data share the SQLite database at `cli.sqlite3`. The Google token has a fixed location:
 
 ```text
 $XDG_DATA_HOME/cli/google/oauth-token.json
 ```
 
-Application data and runtime directories follow `$XDG_DATA_HOME/cli/<app>/` and `$XDG_RUNTIME_DIR/cli/<app>/`. Runtime operations return an error when `$XDG_RUNTIME_DIR` is unset. Directories use mode `0700`; database and token files use mode `0600`.
+For these apps, data and runtime directories follow `$XDG_DATA_HOME/cli/<app>/` and `$XDG_RUNTIME_DIR/cli/<app>/`. Runtime operations return an error when `$XDG_RUNTIME_DIR` is unset. Directories use mode `0700`; database and token files use mode `0600`.
+
+Workmux uses `~/.config/cli/workmux` for configuration and `$XDG_STATE_HOME/cli/workmux` for state, defaulting to `~/.local/state/cli/workmux` when `$XDG_STATE_HOME` is unset. A supplied `$XDG_STATE_HOME` must be absolute. It uses private JSON files and per-repository `flock` locks, not SQLite. It does not require `$XDG_DATA_HOME` or `$XDG_RUNTIME_DIR` to be set.
 
 ## OpenCode API setup
 
@@ -88,3 +92,16 @@ awk  fold  less  tput
 ```
 
 Inside tmux it uses `tmux display-message` instead of `tput` to determine width. The reader folds each article to the terminal width, pipes it through `awk` to color headings, preserves a terminal hyperlink for the title, and sends the result directly to `less`.
+
+## Workmux
+
+Workmux manages linked Git worktrees and tmux windows, with optional Podman sandboxes. It targets Linux with Bash, Git, and tmux 3.2+. Run lifecycle commands in a host shell inside the repository or a linked worktree. `add` and `open` require a live tmux pane with valid `$TMUX` and `$TMUX_PANE`; Podman is needed only for sandboxed commands.
+
+```sh
+tmux new-session -s dev
+cli workmux add feature/login --base main
+cli workmux close feature/login
+cli workmux open feature/login
+```
+
+See the [Workmux command guide](docs/workmux/README.md) for commands and workflows.
