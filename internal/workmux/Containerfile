@@ -1,7 +1,7 @@
 FROM docker.io/library/fedora:44
 
 RUN /bin/bash -euc ' \
-    dnf -y install --allowerasing bash git ca-certificates curl tar gzip unzip findutils ripgrep coreutils shadow-utils; \
+    dnf -y install --allowerasing bash git ca-certificates curl tar gzip unzip findutils ripgrep coreutils shadow-utils nodejs npm chromium; \
     dnf clean all; \
     useradd --uid 1000 --user-group --no-create-home --home-dir /tmp --shell /bin/bash sandbox; \
     install -d -m 1777 /tmp/.local /tmp/.local/share /tmp/.local/state /tmp/.local/bin /tmp/.config /tmp/.cache \
@@ -12,11 +12,16 @@ RUN HOME=/root SHELL=/bin/bash bash /tmp/opencode-install.sh --no-modify-path
 RUN install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode
 RUN rm -rf /root/.opencode /tmp/opencode-install.sh
 
+RUN npm install --global --prefix /usr/local @playwright/cli@latest
+RUN npm cache clean --force
+
 ENV HOME=/tmp \
     XDG_DATA_HOME=/tmp/.local/share \
     XDG_CONFIG_HOME=/tmp/.config \
     XDG_STATE_HOME=/tmp/.local/state \
     XDG_CACHE_HOME=/tmp/.cache \
+    PLAYWRIGHT_MCP_EXECUTABLE_PATH=/usr/bin/chromium-browser \
+    PLAYWRIGHT_MCP_OUTPUT_DIR=/tmp/playwright-output \
     PATH=/tmp/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 USER 1000:1000
