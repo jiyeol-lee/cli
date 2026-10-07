@@ -61,6 +61,46 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAudio(t *testing.T) {
+	for _, test := range []struct {
+		name, global, repo string
+		want               bool
+	}{
+		{"default", "{}", "{}", false},
+		{"global", "sandbox: {audio: true}", "{}", true},
+		{"empty", "sandbox: {audio: true}", "sandbox: {}", true},
+		{"null", "sandbox: {audio: true}", "sandbox: {audio: null}", true},
+		{"false", "sandbox: {audio: true}", "sandbox: {audio: false}", false},
+		{"true", "sandbox: {audio: false}", "sandbox: {audio: true}", true},
+		{"independent", "sandbox: {enabled: true, audio: true}", "sandbox: {enabled: false}", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfigFixture(t, dir, "config.yaml", test.global)
+			writeConfigFixture(t, dir, "project.yaml", test.repo)
+			config, err := LoadConfig(dir, "project")
+			if err != nil || config.Sandbox.Audio != test.want {
+				t.Fatalf("audio = %t, %v, want %t", config.Sandbox.Audio, err, test.want)
+			}
+			data, err := yaml.Marshal(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			layer, err := decodeConfig(data)
+			if err != nil || layer.Sandbox.Audio == nil || *layer.Sandbox.Audio != test.want {
+				t.Fatalf("YAML round trip = %s, %v", data, err)
+			}
+		})
+	}
+	for _, value := range []string{"yes", "1", "'true'", "[]", "{}"} {
+		t.Run(value, func(t *testing.T) {
+			if _, err := decodeConfig([]byte("sandbox: {audio: " + value + "}")); err == nil || !strings.Contains(err.Error(), "sandbox.audio as a boolean") {
+				t.Fatalf("accepted audio %s: %v", value, err)
+			}
+		})
+	}
+}
+
 func TestLoadConfigEmptyDocuments(t *testing.T) {
 	for _, test := range []struct{ name, data string }{
 		{"zero bytes", ""},

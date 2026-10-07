@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 type Containers struct {
@@ -35,6 +36,7 @@ type sandboxEngine struct {
 	Endpoint string
 	Prefix   []string
 	Host     string
+	Remote   *bool
 }
 
 var sandboxEngineEnvKeys = []string{
@@ -217,6 +219,16 @@ func (c *Containers) runArgs(ctx context.Context, engine sandboxEngine, w Worksp
 			return nil, err
 		}
 	}
+	var audioSocket string
+	if w.Config.Sandbox.Audio {
+		if engine.Remote == nil || *engine.Remote {
+			return nil, fmt.Errorf("sandbox.audio requires local Podman: remote or unidentified Podman service is unsupported; select a local engine or set sandbox.audio: false")
+		}
+		audioSocket, err = sandboxAudioSocket()
+		if err != nil {
+			return nil, fmt.Errorf("sandbox.audio: %w; start the host PipeWire service and check PIPEWIRE_REMOTE and PIPEWIRE_RUNTIME_DIR/XDG_RUNTIME_DIR, or set sandbox.audio: false", err)
+		}
+	}
 	labels["endpoint"] = engine.Endpoint
 	session := rand.Text()
 	if w.SandboxRun != "" {
@@ -255,12 +267,51 @@ func (c *Containers) runArgs(ctx context.Context, engine sandboxEngine, w Worksp
 	for _, entry := range append(plan.Env, env...) {
 		args = append(args, "--env", entry)
 	}
+	if audioSocket != "" {
+		// Never relabel the host service socket or expose its runtime directory.
+		args = append(args, "--mount", "type=bind,source="+audioSocket+",target=/run/cli-workmux/pipewire/pipewire-0,readonly",
+			"--env", "PIPEWIRE_RUNTIME_DIR=/run/cli-workmux/pipewire", "--env", "PIPEWIRE_REMOTE=pipewire-0")
+	}
 	for _, key := range []string{"TERM", "COLORTERM"} {
 		if value := c.getenv(key); value != "" {
 			args = append(args, "--env", key+"="+value)
 		}
 	}
 	return append(args, image, "bash", "-c", command), nil
+}
+
+func sandboxAudioSocket() (string, error) {
+	// Like Podman selection, host audio must ignore OpenCode's injected Getenv.
+	path := os.Getenv("PIPEWIRE_REMOTE")
+	if path == "" {
+		path = "pipewire-0"
+	}
+	if !filepath.IsAbs(path) {
+		if filepath.Base(path) != path || path == "." || path == ".." {
+			return "", fmt.Errorf("PIPEWIRE_REMOTE must be a socket name or an absolute socket path")
+		}
+		var runtime string
+		for _, key := range []string{"PIPEWIRE_RUNTIME_DIR", "XDG_RUNTIME_DIR", "USERPROFILE"} {
+			if runtime = os.Getenv(key); runtime != "" {
+				break
+			}
+		}
+		if err := sandboxMountPath(runtime); err != nil {
+			return "", fmt.Errorf("invalid host PipeWire runtime directory: %w", err)
+		}
+		path = filepath.Join(runtime, path)
+	}
+	if err := sandboxCanonical(path); err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("inspect host PipeWire socket %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Getuid()) {
+		return "", fmt.Errorf("host PipeWire socket must be a Unix socket owned by the current user: %s", path)
+	}
+	return path, nil
 }
 
 func (c *Containers) Exec(ctx context.Context, w Workspace, command string, env []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -453,7 +504,10 @@ func (c *Containers) engineInfo(ctx context.Context, engine sandboxEngine) (sand
 		return engine, fmt.Errorf("identify Podman store: %w", err)
 	}
 	var info struct {
-		Host  struct{ DatabaseBackend, Hostname string }
+		Host struct {
+			DatabaseBackend, Hostname string
+			ServiceIsRemote           *bool
+		}
 		Store struct {
 			GraphRoot, RunRoot, GraphDriverName, ConfigFile string
 			TransientStore                                  bool
@@ -466,6 +520,7 @@ func (c *Containers) engineInfo(ctx context.Context, engine sandboxEngine) (sand
 		return engine, fmt.Errorf("podman did not identify its storage endpoint")
 	}
 	engine.Host = info.Host.Hostname
+	engine.Remote = info.Host.ServiceIsRemote
 	scope := []string{"podman", strconv.Itoa(os.Getuid()), info.Store.GraphRoot, info.Store.RunRoot, info.Store.GraphDriverName, info.Store.ConfigFile, info.Host.DatabaseBackend, strconv.FormatBool(info.Store.TransientStore)}
 	engine.Endpoint = fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(scope, "\x00"))))
 	return engine, nil

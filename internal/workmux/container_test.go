@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +19,7 @@ import (
 	"time"
 )
 
-const sandboxTestInfo = `{"Host":{"DatabaseBackend":"sqlite","Security":{"Rootless":true}},"Store":{"GraphRoot":"/tmp/cli-workmux-engine/store","RunRoot":"/tmp/cli-workmux-engine/run","GraphDriverName":"overlay","ConfigFile":"/tmp/cli-workmux-engine/storage.conf"}}`
+const sandboxTestInfo = `{"Host":{"DatabaseBackend":"sqlite","ServiceIsRemote":false,"Security":{"Rootless":true}},"Store":{"GraphRoot":"/tmp/cli-workmux-engine/store","RunRoot":"/tmp/cli-workmux-engine/run","GraphDriverName":"overlay","ConfigFile":"/tmp/cli-workmux-engine/storage.conf"}}`
 
 type sandboxTestEngine struct {
 	calls                                  []Process
@@ -343,6 +344,148 @@ func (c *Containers) testRunCommand(ctx context.Context, w Workspace, command st
 		return nil, err
 	}
 	return append(engine.Prefix, args...), nil
+}
+
+func TestContainersAudio(t *testing.T) {
+	for _, test := range []struct {
+		name, wantErr string
+		disabled      bool
+	}{
+		{name: "default"},
+		{name: "resolved engine"},
+		{name: "runtime override"},
+		{name: "named remote"},
+		{name: "absolute remote"},
+		{name: "missing", wantErr: "no such file"},
+		{name: "file", wantErr: "must be a Unix socket"},
+		{name: "directory", wantErr: "must be a Unix socket"},
+		{name: "symlink", wantErr: "symbolic links"},
+		{name: "runtime symlink", wantErr: "symbolic links"},
+		{name: "unset runtime", wantErr: "runtime directory"},
+		{name: "relative runtime", wantErr: "runtime directory"},
+		{name: "relative remote", wantErr: "socket name or an absolute socket path"},
+		{name: "unsafe remote", wantErr: "unsafe character"},
+		{name: "remote Podman", wantErr: "requires local Podman"},
+		{name: "unknown Podman", wantErr: "requires local Podman"},
+		{name: "disabled", disabled: true},
+		{name: "disabled remote", disabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, w, runner := sandboxTestFixture(t)
+			w.Config.Sandbox.Audio = !test.disabled
+			runtime := t.TempDir()
+			socket := filepath.Join(runtime, "pipewire-0")
+			if test.name == "named remote" || test.name == "absolute remote" {
+				socket = filepath.Join(runtime, "custom")
+			}
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = listener.Close() })
+			t.Setenv("PIPEWIRE_RUNTIME_DIR", "")
+			t.Setenv("PIPEWIRE_REMOTE", "")
+			t.Setenv("XDG_RUNTIME_DIR", runtime)
+			t.Setenv("USERPROFILE", "")
+			// OpenCode's injected environment must not choose the host socket.
+			c.Getenv = func(key string) string {
+				if key == "PIPEWIRE_RUNTIME_DIR" || key == "XDG_RUNTIME_DIR" || key == "PIPEWIRE_REMOTE" {
+					return "/injected/not-host"
+				}
+				return ""
+			}
+			switch test.name {
+			case "runtime override":
+				t.Setenv("PIPEWIRE_RUNTIME_DIR", runtime)
+				t.Setenv("XDG_RUNTIME_DIR", "/not-the-audio-runtime")
+			case "named remote":
+				t.Setenv("PIPEWIRE_REMOTE", "custom")
+			case "absolute remote":
+				t.Setenv("PIPEWIRE_REMOTE", socket)
+				t.Setenv("XDG_RUNTIME_DIR", "")
+			case "missing", "disabled", "disabled remote":
+				t.Setenv("PIPEWIRE_REMOTE", "missing")
+			case "file":
+				path := filepath.Join(runtime, "file")
+				sandboxTestWrite(t, path, "not a socket")
+				t.Setenv("PIPEWIRE_REMOTE", path)
+			case "directory":
+				t.Setenv("PIPEWIRE_REMOTE", runtime)
+			case "symlink":
+				path := filepath.Join(runtime, "link")
+				if err := os.Symlink(socket, path); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PIPEWIRE_REMOTE", path)
+			case "runtime symlink":
+				path := filepath.Join(t.TempDir(), "link")
+				if err := os.Symlink(runtime, path); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("XDG_RUNTIME_DIR", path)
+			case "unset runtime":
+				t.Setenv("XDG_RUNTIME_DIR", "")
+			case "relative runtime":
+				t.Setenv("XDG_RUNTIME_DIR", "relative")
+			case "relative remote":
+				t.Setenv("PIPEWIRE_REMOTE", "../pipewire-0")
+			case "unsafe remote":
+				t.Setenv("PIPEWIRE_REMOTE", socket+",relabel=shared")
+			}
+			if test.name == "remote Podman" || test.name == "disabled remote" {
+				runner.info = strings.Replace(sandboxTestInfo, `"ServiceIsRemote":false`, `"ServiceIsRemote":true`, 1)
+			}
+			if test.name == "unknown Podman" {
+				runner.info = strings.Replace(sandboxTestInfo, `"ServiceIsRemote":false,`, "", 1)
+			}
+			engine := sandboxCurrentEngine()
+			if test.name == "resolved engine" {
+				engine, err = c.sessionEngineFor(t.Context(), engine)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			args, err := c.runArgs(t.Context(), engine, w, "opencode", nil, true, true)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) || !strings.Contains(err.Error(), "sandbox.audio") {
+					t.Fatalf("runArgs = %q, %v, want %s", args, err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			mounts, env := []string{}, []string{}
+			for i, arg := range args {
+				if arg == "--mount" {
+					mounts = append(mounts, args[i+1])
+				}
+				if arg == "--env" {
+					env = append(env, args[i+1])
+				}
+				if strings.Contains(arg, "/dev/snd") || strings.Contains(arg, "privileged") || arg == "--security-opt" {
+					t.Fatalf("unsafe audio arguments: %q", args)
+				}
+			}
+			wantMount := "type=bind,source=" + socket + ",target=/run/cli-workmux/pipewire/pipewire-0,readonly"
+			if slices.Contains(mounts, wantMount) == test.disabled || !slices.Contains(args, "--userns=keep-id") {
+				t.Fatalf("audio mount or user namespace = %q", args)
+			}
+			for _, want := range []string{"PIPEWIRE_RUNTIME_DIR=/run/cli-workmux/pipewire", "PIPEWIRE_REMOTE=pipewire-0"} {
+				if slices.Contains(env, want) == test.disabled {
+					t.Fatalf("audio env = %q", env)
+				}
+			}
+			for _, mount := range mounts {
+				if mount != wantMount && !strings.Contains(mount, "relabel=shared") {
+					t.Fatalf("changed existing mount security: %s", mount)
+				}
+				if strings.Contains(mount, "source="+runtime+",") {
+					t.Fatalf("mounted whole runtime directory: %s", mount)
+				}
+			}
+		})
+	}
 }
 
 func TestContainersEphemeralRunArguments(t *testing.T) {

@@ -83,6 +83,7 @@ pre_remove: []
 
 sandbox:
   enabled: false
+  audio: false
   image: localhost/cli-workmux:fedora44
 
   # Optional read-only OpenCode configuration override.
@@ -162,6 +163,7 @@ Hooks run through host Bash in the workspace directory, even when pane sandboxin
 | Field | Default and behavior |
 |---|---|
 | `enabled` | `false`; enables automatic OpenCode pane sandboxing |
+| `audio` | `false`; grants host PipeWire playback and microphone access to sandbox commands |
 | `image` | `localhost/cli-workmux:fedora44` |
 | `opencode_config_dir` | `$XDG_CONFIG_HOME/opencode`, otherwise `~/.config/opencode` |
 
@@ -172,6 +174,25 @@ Sandboxed panes launch `cli workmux sandbox run -- opencode`, with the configure
 If the OpenCode configuration directory exists, it is mounted read-only at `/tmp/.config/opencode`. A missing directory is not created or mounted. Overrides support `~/...` and must identify a real directory rather than a symlink.
 
 Sandbox runs wait for the repository's preparation lock, then release it after registering and before running the foreground command. Cancellation ends the lock wait. Other workmux commands still report a busy repository immediately.
+
+### Host audio
+
+To allow notification sounds and microphone recording, set this in your global or repository configuration:
+
+```yaml
+sandbox:
+  audio: true
+```
+
+Audio is off by default. A repository's `audio: false` overrides a global `true`; omission or `null` inherits. This setting applies to all sandbox commands, including manual `sandbox run` when automatic pane sandboxing is disabled. It grants access to the host PipeWire service, including microphone capture, not playback alone. Only enable it for commands you trust.
+
+Rebuild the bundled image with `cli workmux sandbox build` to install `pipewire-alsa` and `pipewire-utils`. The ALSA plugin routes default ALSA playback through PipeWire; the utilities include `pw-play` and `pw-record`. Custom images need equivalent client packages. No PipeWire server runs inside the container.
+
+Audio requires local Podman and a running host PipeWire service. Workmux uses the real host process environment, not OpenCode's injected configuration environment. `PIPEWIRE_REMOTE` selects a socket name or absolute socket path and defaults to `pipewire-0`. For a socket name, the runtime directory comes from `PIPEWIRE_RUNTIME_DIR`, then `XDG_RUNTIME_DIR`, then `USERPROFILE`. The socket must be owned by the current user, with a clean absolute path and no symlinks. Missing or invalid sockets, remote Podman, and Podman versions that cannot identify remote mode fail launch with an error rather than silently disabling audio.
+
+Workmux mounts only that socket, read-only at `/run/cli-workmux/pipewire/pipewire-0`, and sets `PIPEWIRE_RUNTIME_DIR` and `PIPEWIRE_REMOTE` inside the container. A read-only socket mount still permits playback and recording through the protocol. It does not expose `/dev/snd` or the whole host runtime directory, change `--userns=keep-id`, relabel the host socket, or disable SELinux. Existing checkout and configuration mount protections remain unchanged.
+
+If PipeWire restarts and replaces its socket, exit and recreate the sandbox session. Changes to the audio setting also require a new session. Fedora SELinux policy may block socket access even when the mount succeeds; host playback and SELinux compatibility need verification on the target system. Check denial reports rather than relabeling the host socket or disabling SELinux globally.
 
 ## 3. sandbox build
 
@@ -190,7 +211,7 @@ cli workmux sandbox build --no-cache
 - Builds from an isolated context, not your repository.
 - `--no-cache` is forwarded to Podman.
 
-The bundled image uses Fedora 44 and installs OpenCode, Bash, Git, curl, CA certificates, ripgrep, archive utilities, findutils, coreutils, and shadow utilities. Its default command is Bash. It does not install Go or Node.js. The build downloads the OpenCode installer; its version is not pinned.
+The bundled image uses Fedora 44 and installs OpenCode, Bash, Git, curl, CA certificates, ripgrep, archive utilities, findutils, coreutils, shadow utilities, and PipeWire ALSA clients and utilities. Its default command is Bash. It does not install Go or Node.js. The build downloads the OpenCode installer; its version is not pinned.
 
 Run this before launching a sandbox if its image is missing. Launch does not build or pull an image automatically.
 

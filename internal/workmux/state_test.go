@@ -273,6 +273,36 @@ func stateTestSandboxJSON(t *testing.T, state workspaceState, sandbox string) st
 	return string(data)
 }
 
+func TestStateAudioConfig(t *testing.T) {
+	for _, test := range []struct {
+		data string
+		want bool
+	}{
+		{`{"enabled":true,"image":"localhost/test"}`, false},
+		{`{"audio":false}`, false},
+		{`{"audio":true}`, true},
+	} {
+		config := SandboxConfig{Audio: true}
+		if err := json.Unmarshal([]byte(test.data), &config); err != nil || config.Audio != test.want {
+			t.Fatalf("decode %s = %+v, %v", test.data, config, err)
+		}
+		data, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var reloaded SandboxConfig
+		if err := json.Unmarshal(data, &reloaded); err != nil || reloaded != config {
+			t.Fatalf("round trip = %+v, %v, want %+v", reloaded, err, config)
+		}
+	}
+	for _, data := range []string{`{"audio":"true"}`, `{"audio":1}`, `{"audio":true,"unknown":false}`} {
+		var config SandboxConfig
+		if err := json.Unmarshal([]byte(data), &config); err == nil {
+			t.Fatalf("accepted invalid saved config: %s", data)
+		}
+	}
+}
+
 func TestStateSandboxConfigRoundTrip(t *testing.T) {
 	f := newHostFixture(t, "")
 	if err := f.run(t, "add", "topic"); err != nil {
@@ -282,6 +312,7 @@ func TestStateSandboxConfigRoundTrip(t *testing.T) {
 	state.Config.Sandbox = SandboxConfig{
 		OpenCodeConfigDir: filepath.Join(f.home, "custom opencode"),
 		Enabled:           true,
+		Audio:             true,
 		Image:             "localhost/custom:latest",
 	}
 	store := hostStateStore(t, f)

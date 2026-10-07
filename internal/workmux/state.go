@@ -75,6 +75,7 @@ func (config *SandboxConfig) UnmarshalJSON(data []byte) error {
 		LegacySELinuxType *string `json:"selinux_type"`
 		OpenCodeConfigDir string  `json:"opencode_config_dir"`
 		Enabled           bool    `json:"enabled"`
+		Audio             bool    `json:"audio"`
 		Image             string  `json:"image"`
 		Target            string  `json:"target"`
 		Container         *struct {
@@ -89,7 +90,7 @@ func (config *SandboxConfig) UnmarshalJSON(data []byte) error {
 	if saved.Enabled && saved.Container != nil && saved.Container.Runtime != "" && saved.Container.Runtime != "podman" {
 		return fmt.Errorf("unsupported previous sandbox backend %q in workspace state: only Podman workspaces can be used; recover this workspace with the previous implementation", saved.Container.Runtime)
 	}
-	*config = SandboxConfig{OpenCodeConfigDir: saved.OpenCodeConfigDir, Enabled: saved.Enabled, Image: saved.Image}
+	*config = SandboxConfig{OpenCodeConfigDir: saved.OpenCodeConfigDir, Enabled: saved.Enabled, Audio: saved.Audio, Image: saved.Image}
 	return nil
 }
 

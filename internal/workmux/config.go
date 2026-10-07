@@ -51,6 +51,7 @@ type Layout struct {
 type SandboxConfig struct {
 	OpenCodeConfigDir string `yaml:"opencode_config_dir,omitempty" json:"opencode_config_dir,omitempty"`
 	Enabled           bool   `yaml:"enabled" json:"enabled"`
+	Audio             bool   `yaml:"audio" json:"audio"`
 	Image             string `yaml:"image" json:"image"`
 }
 
@@ -92,6 +93,7 @@ type configStrings []string
 type configSandbox struct {
 	OpenCodeConfigDir *string `yaml:"opencode_config_dir"`
 	Enabled           *bool   `yaml:"enabled"`
+	Audio             *bool   `yaml:"audio"`
 	Image             *string `yaml:"image"`
 }
 
@@ -283,7 +285,7 @@ func validateConfigSchema(node *yaml.Node, path, schema string, active map[*yaml
 			fields := map[string][]string{
 				"config":  {"panes", "files", "layouts", "post_create", "pre_merge", "pre_remove", "sandbox"},
 				"files":   {"copy", "symlink"},
-				"sandbox": {"opencode_config_dir", "enabled", "image"},
+				"sandbox": {"opencode_config_dir", "enabled", "audio", "image"},
 				"layout":  {"panes"},
 				"pane":    {"name", "command", "split", "size", "percentage", "focus", "zoom", "target"},
 			}
@@ -295,7 +297,7 @@ func validateConfigSchema(node *yaml.Node, path, schema string, active map[*yaml
 					return fmt.Errorf("%s.%s at line %d: unsupported sandbox.selinux_type: remove this setting; sandbox bind mounts now use shared SELinux relabeling", path, key.Value, key.Line)
 				}
 				if schema == "sandbox" && slices.Contains([]string{"container", "engine", "backend", "runtime"}, key.Value) {
-					return fmt.Errorf("%s.%s at line %d: sandbox always uses Podman; keep enabled, image and opencode_config_dir", path, key.Value, key.Line)
+					return fmt.Errorf("%s.%s at line %d: sandbox always uses Podman; keep enabled, audio, image and opencode_config_dir", path, key.Value, key.Line)
 				}
 				if schema == "config" {
 					return fmt.Errorf("unsupported config field %s at line %d", key.Value, key.Line)
@@ -447,17 +449,17 @@ func (sandbox *configSandbox) UnmarshalYAML(node *yaml.Node) error {
 				return fmt.Errorf("sandbox.%s must be a string", key)
 			}
 		}
-		if key == "enabled" {
+		if key == "enabled" || key == "audio" {
 			value := node.Content[i+1]
 			for value.Kind == yaml.AliasNode {
 				value = value.Alias
 			}
 			if value.Tag != "!!null" && value.Tag != "!!bool" {
-				return fmt.Errorf("cannot unmarshal sandbox.enabled as a boolean")
+				return fmt.Errorf("cannot unmarshal sandbox.%s as a boolean", key)
 			}
 		}
 		if slices.Contains([]string{"container", "engine", "backend", "runtime"}, key) {
-			return fmt.Errorf("unsupported sandbox.%s: sandbox always uses Podman; keep enabled, image and opencode_config_dir", key)
+			return fmt.Errorf("unsupported sandbox.%s: sandbox always uses Podman; keep enabled, audio, image and opencode_config_dir", key)
 		}
 	}
 	type plain configSandbox
@@ -512,6 +514,9 @@ func mergeConfig(config *Config, layer configFile, repo bool) error {
 		}
 		if sandbox.Enabled != nil {
 			config.Sandbox.Enabled = *sandbox.Enabled
+		}
+		if sandbox.Audio != nil {
+			config.Sandbox.Audio = *sandbox.Audio
 		}
 		if sandbox.Image != nil {
 			config.Sandbox.Image = *sandbox.Image

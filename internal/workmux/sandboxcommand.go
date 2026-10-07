@@ -40,6 +40,7 @@ const initExample = `# Repository overrides for cli workmux. Nothing here is ena
 # To append a user command instead: post_create: ["<global>", "git status --short"]
 # sandbox:
 #   enabled: true
+#   audio: false # Opt in to host PipeWire playback AND microphone access.
 #   image: localhost/cli-workmux:fedora44
 #   opencode_config_dir: ~/dotfiles/.opencode # Optional real directory, not a symlink; mounted read-only at /tmp/.config/opencode.
 `
@@ -61,6 +62,7 @@ const globalInitExample = `# Global defaults for cli workmux. Nothing here is en
 # Optional user command: post_create: ["git status --short"]
 # sandbox:
 #   enabled: true
+#   audio: false # Opt in to host PipeWire playback AND microphone access.
 #   image: localhost/cli-workmux:fedora44
 #   opencode_config_dir: ~/dotfiles/.opencode # Optional real directory, not a symlink; mounted read-only at /tmp/.config/opencode.
 `
