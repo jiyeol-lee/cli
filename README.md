@@ -61,7 +61,7 @@ Workmux uses `~/.config/cli/workmux` for configuration and `$XDG_STATE_HOME/cli/
 `study` and `story` call the streaming Responses API at `https://opencode.ai/zen/go/v1/responses` with model `gpt-5.6-luna` and `low` reasoning effort.
 
 ```sh
-export OPENCODE_GO_API_KEY=...
+export OPENCODE_API_KEY=...
 ```
 
 No API key is needed for vocabulary storage or AP News.
