@@ -9,9 +9,13 @@ import (
 	"testing"
 )
 
-type fakeGenerator struct{ err error }
+type fakeGenerator struct {
+	err         error
+	temperature float64
+}
 
-func (f fakeGenerator) Generate(_ context.Context, _ string, out io.Writer) error {
+func (f *fakeGenerator) Generate(_ context.Context, _ string, temperature float64, out io.Writer) error {
+	f.temperature = temperature
 	if f.err != nil {
 		return f.err
 	}
@@ -21,7 +25,7 @@ func (f fakeGenerator) Generate(_ context.Context, _ string, out io.Writer) erro
 
 type truncatedGenerator struct{}
 
-func (truncatedGenerator) Generate(_ context.Context, _ string, out io.Writer) error {
+func (truncatedGenerator) Generate(_ context.Context, _ string, _ float64, out io.Writer) error {
 	_, err := parseSSE(strings.NewReader("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"), out)
 	return err
 }
@@ -32,7 +36,7 @@ func TestStudyIncrementsOnlyAfterGeneration(t *testing.T) {
 	if err := repo.Add(ctx, "Word"); err != nil {
 		t.Fatal(err)
 	}
-	app := App{Repo: repo, AI: fakeGenerator{err: errors.New("failed")}, Stdout: &bytes.Buffer{}}
+	app := App{Repo: repo, AI: &fakeGenerator{err: errors.New("failed")}, Stdout: &bytes.Buffer{}}
 	if err := app.Run(ctx, []string{"study"}); err == nil {
 		t.Fatal("expected error")
 	}
@@ -40,7 +44,7 @@ func TestStudyIncrementsOnlyAfterGeneration(t *testing.T) {
 	if words[0].ReadCount != 0 {
 		t.Fatal("failed generation incremented count")
 	}
-	app.AI = fakeGenerator{}
+	app.AI = &fakeGenerator{}
 	if err := app.Run(ctx, []string{"study"}); err != nil {
 		t.Fatal(err)
 	}
@@ -72,9 +76,13 @@ func TestStudyDoesNotIncrementAfterTruncatedAIStream(t *testing.T) {
 func TestStudyWithArgumentDoesNotUseRepository(t *testing.T) {
 	repo := testRepository(t)
 	var out bytes.Buffer
-	app := App{Repo: repo, AI: fakeGenerator{}, Stdout: &out}
+	generator := &fakeGenerator{}
+	app := App{Repo: repo, AI: generator, Stdout: &out}
 	if err := app.Run(context.Background(), []string{"study", "Ad Hoc"}); err != nil {
 		t.Fatal(err)
+	}
+	if generator.temperature != 0.1 {
+		t.Fatalf("temperature = %v", generator.temperature)
 	}
 	words, err := repo.List(context.Background())
 	if err != nil {
@@ -82,6 +90,21 @@ func TestStudyWithArgumentDoesNotUseRepository(t *testing.T) {
 	}
 	if len(words) != 0 {
 		t.Fatalf("words = %#v", words)
+	}
+}
+
+func TestStoryUsesHighTemperature(t *testing.T) {
+	repo := testRepository(t)
+	if err := repo.Add(context.Background(), "Word"); err != nil {
+		t.Fatal(err)
+	}
+	generator := &fakeGenerator{}
+	app := App{Repo: repo, AI: generator, Stdout: &bytes.Buffer{}}
+	if err := app.Run(context.Background(), []string{"story"}); err != nil {
+		t.Fatal(err)
+	}
+	if generator.temperature != 1 {
+		t.Fatalf("temperature = %v", generator.temperature)
 	}
 }
 

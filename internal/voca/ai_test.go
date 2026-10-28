@@ -70,11 +70,17 @@ func TestAIClientRequestAndFinalNewline(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
 			t.Errorf("Authorization = %q", got)
 		}
+		if got := r.Header.Get("User-Agent"); got != "cli/1.0" {
+			t.Errorf("User-Agent = %q", got)
+		}
+		if got := r.Header.Get("x-opencode-session"); got != "session-id" {
+			t.Errorf("x-opencode-session = %q", got)
+		}
 		var request map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Error(err)
 		}
-		if len(request) != 4 || request["model"] != "gpt-5.6-luna" || request["input"] != "prompt" || request["stream"] != true {
+		if len(request) != 5 || request["model"] != "claude-haiku-5-5" || request["input"] != "prompt" || request["temperature"] != 0.1 || request["stream"] != true {
 			t.Errorf("request = %#v", request)
 		}
 		reasoning, ok := request["reasoning"].(map[string]any)
@@ -86,8 +92,8 @@ func TestAIClientRequestAndFinalNewline(t *testing.T) {
 	}))
 	defer server.Close()
 	var out bytes.Buffer
-	client := AIClient{HTTP: server.Client(), Endpoint: server.URL, APIKey: "secret"}
-	if err := client.Generate(context.Background(), "prompt", &out); err != nil {
+	client := AIClient{HTTP: server.Client(), Endpoint: server.URL, APIKey: "secret", SessionID: "session-id"}
+	if err := client.Generate(context.Background(), "prompt", 0.1, &out); err != nil {
 		t.Fatal(err)
 	}
 	if out.String() != "lesson\n" {

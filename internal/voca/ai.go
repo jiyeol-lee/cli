@@ -14,23 +14,25 @@ import (
 const DefaultAIEndpoint = "https://opencode.ai/zen/go/v1/responses"
 
 type AIClient struct {
-	HTTP     *http.Client
-	Endpoint string
-	APIKey   string
+	HTTP      *http.Client
+	Endpoint  string
+	APIKey    string
+	SessionID string
 }
 
 type responsesRequest struct {
-	Model     string             `json:"model"`
-	Input     string             `json:"input"`
-	Reasoning responsesReasoning `json:"reasoning"`
-	Stream    bool               `json:"stream"`
+	Model       string             `json:"model"`
+	Input       string             `json:"input"`
+	Temperature float64            `json:"temperature"`
+	Reasoning   responsesReasoning `json:"reasoning"`
+	Stream      bool               `json:"stream"`
 }
 
 type responsesReasoning struct {
 	Effort string `json:"effort"`
 }
 
-func (c AIClient) Generate(ctx context.Context, prompt string, out io.Writer) error {
+func (c AIClient) Generate(ctx context.Context, prompt string, temperature float64, out io.Writer) error {
 	if c.APIKey == "" {
 		return fmt.Errorf("OPENCODE_API_KEY is not set")
 	}
@@ -39,10 +41,11 @@ func (c AIClient) Generate(ctx context.Context, prompt string, out io.Writer) er
 		endpoint = DefaultAIEndpoint
 	}
 	body, err := json.Marshal(responsesRequest{
-		Model:     "gpt-5.6-luna",
-		Input:     prompt,
-		Reasoning: responsesReasoning{Effort: "low"},
-		Stream:    true,
+		Model:       "claude-haiku-5-5",
+		Input:       prompt,
+		Temperature: temperature,
+		Reasoning:   responsesReasoning{Effort: "low"},
+		Stream:      true,
 	})
 	if err != nil {
 		return err
@@ -53,6 +56,8 @@ func (c AIClient) Generate(ctx context.Context, prompt string, out io.Writer) er
 	}
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "cli/1.0")
+	req.Header.Set("x-opencode-session", c.SessionID)
 	client := c.HTTP
 	if client == nil {
 		client = http.DefaultClient
