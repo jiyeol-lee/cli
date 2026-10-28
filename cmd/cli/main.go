@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -189,7 +190,7 @@ func runWithDependencies(ctx context.Context, args []string, deps dependencies) 
 		repo := voca.NewRepository(db)
 		app := voca.App{
 			Repo:  repo,
-			AI:    voca.AIClient{HTTP: &http.Client{}, APIKey: os.Getenv("OPENCODE_API_KEY")},
+			AI:    voca.AIClient{HTTP: &http.Client{}, APIKey: os.Getenv("OPENCODE_API_KEY"), SessionID: rand.Text()},
 			News:  voca.News{Scraper: voca.APScraper{HTTP: voca.NewAPHTTPClient()}, Pager: voca.TerminalPager{}},
 			Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr,
 		}

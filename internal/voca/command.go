@@ -9,7 +9,7 @@ import (
 )
 
 type Generator interface {
-	Generate(context.Context, string, io.Writer) error
+	Generate(context.Context, string, float64, io.Writer) error
 }
 type NewsRunner interface {
 	Run(context.Context, io.Reader, io.Writer, io.Writer) error
@@ -50,13 +50,13 @@ func (a App) Run(ctx context.Context, args []string) error {
 			if phrase == "" {
 				return fmt.Errorf("phrase cannot be empty")
 			}
-			return a.AI.Generate(ctx, studyPrompt(phrase), a.Stdout)
+			return a.AI.Generate(ctx, studyPrompt(phrase), 0.1, a.Stdout)
 		}
 		word, err := a.Repo.LeastReadRandom(ctx)
 		if err != nil {
 			return err
 		}
-		if err := a.AI.Generate(ctx, studyPrompt(word.Word), a.Stdout); err != nil {
+		if err := a.AI.Generate(ctx, studyPrompt(word.Word), 0.1, a.Stdout); err != nil {
 			return err
 		}
 		return a.Repo.Increment(ctx, []int64{word.ID})
@@ -73,7 +73,7 @@ func (a App) Run(ctx context.Context, args []string) error {
 		for i, word := range words {
 			names[i], ids[i] = word.Word, word.ID
 		}
-		if err := a.AI.Generate(ctx, storyPrompt(names), a.Stdout); err != nil {
+		if err := a.AI.Generate(ctx, storyPrompt(names), 1, a.Stdout); err != nil {
 			return err
 		}
 		return a.Repo.Increment(ctx, ids)
