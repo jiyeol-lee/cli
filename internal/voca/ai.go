@@ -32,7 +32,7 @@ type responsesReasoning struct {
 
 func (c AIClient) Generate(ctx context.Context, prompt string, out io.Writer) error {
 	if c.APIKey == "" {
-		return fmt.Errorf("OPENCODE_GO_API_KEY is not set")
+		return fmt.Errorf("OPENCODE_API_KEY is not set")
 	}
 	endpoint := c.Endpoint
 	if endpoint == "" {
